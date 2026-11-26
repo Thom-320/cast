@@ -1,5 +1,8 @@
 import config
+import gleam/http
+import gleam/int
 import gleam/list
+import gleam/option
 import gleam/result
 import gleam/string
 import gleamyshell
@@ -14,15 +17,13 @@ const view_output_dir: String = "./view/"
 
 const qr_output_dir: String = "./qr"
 
-pub const server_ip: String = "https://cast.matwa.dev"
-
-pub const websocket_url: String = "ws://cast.matwa.dev/ws/"
 
 type ThisThingError {
   NoUsername
   NoFile
   UnsupportedFileFormat
   InvalidCastCode
+  CodeTaken
   FailedGenerating(why: List(#(String, String)))
 }
 
@@ -52,6 +53,13 @@ pub fn handle_convert(req: wisp.Request, ctx: types.Context) -> wisp.Response {
       |> choose_cast_code,
     )
 
+    // Re-uploading under your own code replaces your deck; someone else's
+    // code is not yours to overwrite.
+    use _ <- result.try(case store.get(ctx.store, cast_code) {
+      option.Some(#(owner, _)) if owner != username -> Error(CodeTaken)
+      _ -> Ok(Nil)
+    })
+
     use _ <- result.try(case determine_filetype(filename) {
       Pdf -> convert_pdf(filename, path, username, cast_code)
       Pptx -> convert_pptx(filename, path, username, cast_code)
@@ -62,7 +70,7 @@ pub fn handle_convert(req: wisp.Request, ctx: types.Context) -> wisp.Response {
     store.set(ctx.store, username, filename, cast_code)
 
     use _ <- result.try(
-      generate_qr_code(cast_code)
+      generate_qr_code(public_base_url(req), cast_code)
       |> result.map_error(FailedGenerating),
     )
 
@@ -84,6 +92,11 @@ pub fn handle_convert(req: wisp.Request, ctx: types.Context) -> wisp.Response {
           wisp.html_response(
             "Cast codes can only use letters, numbers, - and _ (max 32)",
             400,
+          )
+        CodeTaken ->
+          wisp.html_response(
+            "That cast code belongs to another presenter. Pick another one.",
+            409,
           )
         FailedGenerating(why) ->
           wisp.html_response(
@@ -129,9 +142,38 @@ pub fn view_filename(filename: String) -> String {
 }
 
 fn remote_script_tag(cast_code: String) -> String {
+  let ws_attr = case config.get_config().websocket_url {
+    "" -> ""
+    url -> " data-ws-url='" <> url <> "'"
+  }
   "<script src='/assets/cast-remote.js' data-cast-code='"
   <> cast_code
-  <> "'></script>"
+  <> "'"
+  <> ws_attr
+  <> "></script>"
+}
+
+/// PUBLIC_URL if set; otherwise the scheme and host the upload came in on
+/// (honouring X-Forwarded-Proto/Host from the bundled relay or a proxy).
+pub fn public_base_url(req: wisp.Request) -> String {
+  case config.get_config().public_url {
+    "" -> {
+      let header = fn(name, default) {
+        list.key_find(req.headers, name) |> result.unwrap(default)
+      }
+      let default_scheme = case req.scheme {
+        http.Https -> "https"
+        http.Http -> "http"
+      }
+      let default_host = case req.port {
+        option.Some(port) -> req.host <> ":" <> int.to_string(port)
+        option.None -> req.host
+      }
+      let host = header("x-forwarded-host", header("host", default_host))
+      header("x-forwarded-proto", default_scheme) <> "://" <> host
+    }
+    url -> url
+  }
 }
 
 // Uploaded HTML is assumed to already be a Reveal.js deck (e.g. manim-slides),
@@ -169,8 +211,11 @@ fn convert_html(
   }
 }
 
-fn generate_qr_code(cast_code: String) -> Result(Nil, List(#(String, String))) {
-  let qr_url = server_ip <> "/controls/" <> cast_code
+fn generate_qr_code(
+  base_url: String,
+  cast_code: String,
+) -> Result(Nil, List(#(String, String))) {
+  let qr_url = base_url <> "/controls/" <> cast_code
   let qr_path = qr_output_dir <> "/" <> cast_code <> ".png"
   let _ = simplifile.create_directory_all(qr_output_dir)
 

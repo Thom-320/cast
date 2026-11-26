@@ -23,12 +23,13 @@ pub fn main() {
 
   let ctx = types.Context(store:)
   let handler = fn(req) { routes(req, ctx) }
+  let conf = config.get_config()
 
   let assert Ok(_) =
     wisp_mist.handler(handler, secret_key_base)
     |> mist.new
-    |> mist.bind("0.0.0.0")
-    |> mist.port(6767)
+    |> mist.bind(conf.server_host)
+    |> mist.port(conf.server_port)
     |> mist.start
 
   process.sleep_forever()
@@ -91,7 +92,10 @@ fn serve_view_connection_page(code: String, ctx: types.Context) -> Response {
 
       // Construct URLs
       let qr_url = "/qr/" <> code
-      let presentation_url = "/view/" <> username <> "/" <> html_filename
+      // The window opened from here is the projector: the one the remotes
+      // drive and every other screen follows.
+      let presentation_url =
+        "/view/" <> username <> "/" <> html_filename <> "?proyector=1"
       let controls_url = "/controls/" <> code
 
       case simplifile.read("./public/view.html") {
@@ -115,13 +119,14 @@ fn serve_view_connection_page(code: String, ctx: types.Context) -> Response {
 
 fn serve_controls_page(code: String, ctx: types.Context) -> Response {
   case store.get(ctx.store, code) {
-    Some(#(username, filename)) -> {
+    Some(#(username, _filename)) -> {
       use <- wisp.rescue_crashes
       case simplifile.read("./public/controls.html") {
         Ok(content) -> {
           let content_with_code =
             string.replace(content, "{{CAST_CODE}}", code)
-            |> string.replace("{{USERNAME}}", username)
+            |> string.replace("{{USERNAME}}", html_escape(username))
+            |> string.replace("{{WS_URL}}", config.get_config().websocket_url)
           wisp.html_response(content_with_code, 200)
         }
         Error(_) -> wisp.html_response("Controls page not found", 404)
