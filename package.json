@@ -10,7 +10,8 @@
   },
   "scripts": {
     "build:css": "node build-css.js",
-    "dev": "node build-css.js"
+    "dev": "node build-css.js",
+    "test": "node --test test/*.test.js"
   },
   "devDependencies": {
     "@tailwindcss/container-queries": "^0.1.1",
