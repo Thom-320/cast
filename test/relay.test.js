@@ -8,6 +8,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const WebSocket = require("ws");
+const crypto = require("node:crypto");
 
 const RELAY = path.join(__dirname, "..", "websocket_relay.js");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -17,6 +18,9 @@ let upstream, upstreamPort;
 let relay, port;
 let n = 0;
 const code = () => "t" + ++n + Math.random().toString(36).slice(2, 6);
+const SECRET = "test-secret-" + Math.random().toString(36).slice(2);
+// Same derivation as the Gleam server (src/control.gleam).
+const key = (c) => crypto.createHmac("sha256", SECRET).update("cast-control:" + c).digest("base64url").slice(0, 22);
 
 function freePort() {
   return new Promise((res) => {
@@ -36,6 +40,7 @@ async function startRelay() {
       RELAY_HOST: "127.0.0.1",
       GLEAM_URL: "http://127.0.0.1:" + upstreamPort,
       CAST_STATE_FILE: STATE_FILE,
+      CAST_SECRET: SECRET,
       HEARTBEAT_MS: "300",
     },
     stdio: ["ignore", "pipe", "inherit"],
@@ -55,9 +60,12 @@ function url(c, query) {
 // A deck window: mirrors the room when following, obeys commands when principal.
 // Like cast-remote.js it reports where next/prev would land; `delay` simulates
 // a slow projector (busy laptop, bad wifi).
-function screen(c, { start = 0, total = 10, projector = false, delay = 0 } = {}) {
+// Only the presenter's windows carry the control key; audience windows do not.
+function screen(c, { start = 0, total = 10, projector = false, delay = 0, keyed = projector, k = key(c) } = {}) {
   const s = { i: start, principal: false, ws: null, got: [] };
-  s.ws = new WebSocket(url(c, "type=presentation" + (projector ? "&rol=proyector" : "")));
+  s.ws = new WebSocket(
+    url(c, "type=presentation" + (projector ? "&rol=proyector" : "") + (keyed ? "&k=" + k : "")),
+  );
   const pos = (i) => ({ indexh: i, indexv: 0, indexf: -1 });
   const report = () =>
     s.principal &&
@@ -88,7 +96,7 @@ function screen(c, { start = 0, total = 10, projector = false, delay = 0 } = {})
   return s;
 }
 
-function remote(c, query = "type=controller") {
+function remote(c, query = "type=controller&k=" + key(c)) {
   const r = { seen: [], states: [], acks: [], presence: [], outlines: [], hb: 0 };
   r.ws = new WebSocket(url(c, query));
   r.ws.on("message", (d) => {
@@ -197,10 +205,10 @@ test("a projector that reloads resumes the room's slide instead of slide 1", asy
 
 test("without an explicit projector the oldest window leads and others follow", async () => {
   const c = code();
-  const first = screen(c, { start: 2 });
+  const first = screen(c, { start: 2, keyed: true });
   await first.ready;
   await sleep(50);
-  const second = screen(c, { start: 0 });
+  const second = screen(c, { start: 0, keyed: true });
   await second.ready;
   await sleep(100);
   assert.equal(first.principal, true);
@@ -227,7 +235,7 @@ test("old cast clients still work (path / and commands without id)", async () =>
   const c = code();
   const proj = screen(c, { projector: true });
   await proj.ready;
-  const legacy = new WebSocket(`ws://127.0.0.1:${port}/?cast_code=${c}&type=controller`);
+  const legacy = new WebSocket(`ws://127.0.0.1:${port}/?cast_code=${c}&type=controller&k=${key(c)}`);
   await new Promise((r) => legacy.once("open", r));
   await sleep(60);
   legacy.send(JSON.stringify({ type: "cmd", action: "next" }));
@@ -391,7 +399,8 @@ test("HTTP fallback: a phone without WebSockets still follows and controls", asy
   proj.ws.send(JSON.stringify({ type: "outline", slides: [{ h: 0, v: 0, title: "A", notes: "n" }] }));
   await sleep(50);
 
-  const first = await httpReq("GET", `/relay/room/${c}?type=controller&since=0&ov=0`);
+  const k = key(c);
+  const first = await httpReq("GET", `/relay/room/${c}?type=controller&k=${k}&since=0&ov=0`);
   assert.equal(first.status, 200);
   assert.equal(first.headers["access-control-allow-origin"], "*");
   assert.equal(first.body.state.indexh, 2);
@@ -402,22 +411,22 @@ test("HTTP fallback: a phone without WebSockets still follows and controls", asy
   const since = first.body.state.version;
   const ov = first.body.outline.version;
   const t0 = Date.now();
-  const waiting = httpReq("GET", `/relay/room/${c}?type=controller&since=${since}&ov=${ov}`);
+  const waiting = httpReq("GET", `/relay/room/${c}?type=controller&k=${k}&since=${since}&ov=${ov}`);
   await sleep(200);
-  const ack = await httpReq("POST", `/relay/room/${c}/cmd`, { action: "next", id: "h1" });
+  const ack = await httpReq("POST", `/relay/room/${c}/cmd`, { action: "next", id: "h1", k });
   assert.deepEqual(ack.body, { type: "ack", id: "h1", delivered: true });
   const woke = await waiting;
   assert.ok(Date.now() - t0 < 1000, "the poll answered as soon as the slide changed");
   assert.equal(woke.body.state.indexh, 3);
   assert.equal(woke.body.outline, undefined, "the outline is not resent when unchanged");
 
-  const dup = await httpReq("POST", `/relay/room/${c}/cmd`, { action: "next", id: "h1" });
+  const dup = await httpReq("POST", `/relay/room/${c}/cmd`, { action: "next", id: "h1", k });
   assert.equal(dup.body.duplicate, true);
   await sleep(80);
   assert.equal(proj.i, 3, "the resent command did not move twice");
 
   assert.equal((await httpReq("GET", `/relay/room/bad%2Fcode?since=0`)).status, 400);
-  assert.equal((await httpReq("POST", `/relay/room/${c}/cmd`, { action: "explode" })).status, 400);
+  assert.equal((await httpReq("POST", `/relay/room/${c}/cmd`, { action: "explode", k })).status, 400);
   proj.ws.close();
 });
 
@@ -436,4 +445,113 @@ test("HTTP fallback: an audience screen long-polls the projector's slide", async
   assert.equal(woke.body.outline, undefined, "screens never get the notes");
   proj.ws.close();
   r.ws.close();
+});
+
+test("the public code only follows: no control, notes or projector without the key", async () => {
+  const c = code();
+  const proj = screen(c, { projector: true, start: 1 });
+  await proj.ready;
+  await sleep(60);
+  proj.ws.send(JSON.stringify({ type: "outline", slides: [{ h: 0, v: 0, title: "A", notes: "secret notes" }] }));
+  await sleep(50);
+
+  // a remote with no key, or a wrong one, is closed with 4401 and gets nothing
+  for (const q of ["type=controller", "type=controller&k=" + key(c + "x"), "type=controller&k=" + key(c) + "x"]) {
+    const bad = new WebSocket(url(c, q));
+    const got = [];
+    bad.on("message", (d) => got.push(String(d)));
+    const closed = await new Promise((r) => bad.once("close", (codeNum) => r(codeNum)));
+    assert.equal(closed, 4401, q);
+    assert.equal(got.length, 0, "no state, outline or presence before the close");
+  }
+
+  // HTTP fallback: no outline and no commands without the key
+  assert.equal((await httpReq("GET", `/relay/room/${c}?type=controller&since=0`)).status, 401);
+  assert.equal((await httpReq("GET", `/relay/room/${c}?type=controller&k=nope&since=0`)).status, 401);
+  assert.equal((await httpReq("POST", `/relay/room/${c}/cmd`, { action: "next", id: "x1" })).status, 401);
+  assert.equal((await httpReq("POST", `/relay/room/${c}/cmd`, { action: "next", id: "x2", k: 42 })).status, 401);
+  const audiencePoll = await httpReq("GET", `/relay/room/${c}?since=0`);
+  assert.equal(audiencePoll.body.outline, undefined);
+  await sleep(60);
+  assert.equal(proj.i, 1, "nothing moved the projector");
+
+  // an audience window that asks to be the projector without the key stays a follower
+  const hijack = screen(c, { projector: true, keyed: false, start: 7 });
+  await hijack.ready;
+  await sleep(100);
+  assert.equal(hijack.principal, false);
+  assert.equal(proj.principal, true);
+  assert.equal(hijack.i, 1, "it mirrors the real projector");
+  hijack.ws.send(JSON.stringify({ type: "state", indexh: 7, indexv: 0, total: 10 }));
+  await sleep(60);
+  const r = remote(c);
+  await r.ready;
+  await sleep(80);
+  assert.equal(r.seen.at(-1), 1);
+  assert.equal(r.outlines.at(-1).slides[0].notes, "secret notes", "the keyed remote does get the notes");
+
+  // with the real projector gone, the keyless window still never leads
+  proj.ws.close();
+  await sleep(120);
+  assert.equal(hijack.principal, false);
+  r.cmd("next", "x3");
+  await sleep(80);
+  assert.equal(r.acks.at(-1).delivered, false);
+  hijack.ws.close();
+  r.ws.close();
+});
+
+test("a key for one code does not open another room", async () => {
+  const a = code();
+  const b = code();
+  const proj = screen(b, { projector: true });
+  await proj.ready;
+  const r = remote(b, "type=controller&k=" + key(a));
+  const closed = await new Promise((res) => r.ws.once("close", (n) => res(n)));
+  assert.equal(closed, 4401);
+  proj.ws.close();
+});
+
+test("a keyless remote that ignores the close frame cannot crash the relay", async () => {
+  const net = require("node:net");
+  const sock = net.connect(port, "127.0.0.1");
+  await new Promise((r) => sock.once("connect", r));
+  sock.write(
+    `GET /ws/?cast_code=${code()}&type=controller HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n` +
+      `Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n`,
+  );
+  sock.on("data", () => {}); // reads, never answers
+  sock.on("error", () => {});
+  await sleep(1000); // several heartbeat ticks (HEARTBEAT_MS=300)
+  assert.equal(relay.exitCode, null, "the relay is still running");
+  assert.equal((await httpReq("GET", "/relay/health")).status, 200);
+  sock.destroy();
+});
+
+test("audience polls do not see who holds a remote", async () => {
+  const c = code();
+  const proj = screen(c, { projector: true });
+  await proj.ready;
+  const r = remote(c, "type=controller&quien=Ana&k=" + key(c));
+  await r.ready;
+  await sleep(80);
+  const body = (await httpReq("GET", `/relay/room/${c}?since=0`)).body;
+  assert.equal(body.presence, undefined);
+  proj.ws.close();
+  r.ws.close();
+});
+
+test("a malformed escape in the room URL is a 400, not a crash", async () => {
+  const r = await httpReq("GET", "/relay/room/%E0%A4%A");
+  assert.equal(r.status, 400);
+  assert.equal(relay.exitCode, null, "the relay is still running");
+  assert.equal((await httpReq("GET", "/relay/health")).status, 200);
+});
+
+test("audience polls for a code nobody opened create no room", async () => {
+  const before = (await httpReq("GET", "/relay/health")).body.rooms;
+  const polls = [code(), code(), code()].map((c) => httpReq("GET", `/relay/room/${c}?since=0`));
+  await sleep(100);
+  assert.equal((await httpReq("GET", "/relay/health")).body.rooms, before);
+  for (const p of polls) p.catch(() => {});
 });

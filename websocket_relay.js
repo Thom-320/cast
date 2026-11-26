@@ -1,12 +1,12 @@
 // Cast relay: one port for everything.
 //
 //   - WebSocket at /ws/ (also / for old clients):
-//       ?cast_code=CODE&type=presentation|controller[&rol=proyector][&quien=NAME]
+//       ?cast_code=CODE&type=presentation|controller[&k=KEY][&rol=proyector][&quien=NAME]
 //   - HTTP fallback for networks that block WebSockets:
-//       GET  /relay/room/CODE?since=VERSION[&type=controller][&ov=OUTLINE_VERSION]
+//       GET  /relay/room/CODE?since=VERSION[&type=controller&k=KEY][&ov=OUTLINE_VERSION]
 //            long poll: answers at once if the room moved past VERSION, else
 //            waits up to 25 s for the next change.
-//       POST /relay/room/CODE/cmd   body {action, id, indexh?, indexv?} -> ack
+//       POST /relay/room/CODE/cmd   body {action, id, k, indexh?, indexv?} -> ack
 //   - Any other HTTP request is proxied to the Gleam server (GLEAM_URL), so a
 //     single port (and a single tunnel or reverse-proxy rule) serves the whole app.
 //
@@ -15,8 +15,13 @@
 //     the PRINCIPAL (the projector): remotes' commands go only to it, and only its
 //     state counts. Every other screen and every remote follows that absolute
 //     state, so stale tabs can no longer drag the room around.
-//   - The principal is the newest presentation that joined with rol=proyector;
-//     if none did, the oldest connected presentation (implicit principal).
+//   - Control key: the cast code is public (it is in every audience page), so
+//     it only lets a screen FOLLOW. Steering the room needs the control key,
+//     HMAC-SHA256(secret, "cast-control:" + code), which the Gleam server puts
+//     only in the presenter's links and QR. Without it a connection cannot
+//     send commands, read the speaker notes, or become the principal.
+//   - The principal is the newest keyed presentation that joined with
+//     rol=proyector; if none did, the oldest keyed presentation.
 //   - Low latency: the principal reports, with each state, where next and prev
 //     would land. On a command the relay sends that predicted state to every
 //     follower and remote at once, in parallel with the command to the
@@ -38,6 +43,7 @@
 //   relay -> state (predicted:true when not yet confirmed) | outline (remotes)
 //            | {type:"rol", principal, state?} | presence | ack | hb
 
+const crypto = require("crypto");
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
@@ -55,6 +61,42 @@ const MAX_PER_SECOND = 40;
 const MAX_OUTLINE_BYTES = 256 * 1024;
 
 const rooms = new Map();
+
+// ---------------------------------------------------------------- control key
+// Shared with the Gleam server: CAST_SECRET, or the file it creates on start.
+const SECRET_FILE = process.env.CAST_SECRET_FILE || path.join(__dirname, "data", "cast-secret");
+let secretCache = (process.env.CAST_SECRET || "").trim();
+let warnedNoSecret = false;
+let lastSecretRead = 0;
+function secret() {
+  // Until the file exists, look again at most every 2 s.
+  if (!secretCache && Date.now() - lastSecretRead > 2000) {
+    lastSecretRead = Date.now();
+    try {
+      secretCache = fs.readFileSync(SECRET_FILE, "utf8").trim();
+    } catch {
+      // not created yet (the Gleam server makes it on start)
+    }
+  }
+  if (!secretCache && !warnedNoSecret) {
+    warnedNoSecret = true;
+    console.error(`relay: no CAST_SECRET and no ${SECRET_FILE}; remote control is refused until one exists`);
+  }
+  return secretCache;
+}
+function controlKey(code) {
+  const s = secret();
+  if (!s) return "";
+  return crypto.createHmac("sha256", s).update("cast-control:" + code).digest("base64url").slice(0, 22);
+}
+// Fails closed: no secret, no control.
+function validKey(code, k) {
+  const want = controlKey(code);
+  if (!want || typeof k !== "string") return false;
+  const a = Buffer.from(k);
+  const b = Buffer.from(want);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
 
 // ---------------------------------------------------------------- persistence
 
@@ -115,11 +157,12 @@ function send(ws, msg) {
   if (isOpen(ws)) ws.send(typeof msg === "string" ? msg : JSON.stringify(msg));
 }
 
-// Explicit projector (newest wins), otherwise the oldest presentation.
+// Among keyed presentations: explicit projector (newest wins), otherwise the
+// oldest. A presentation without the key only follows.
 function pickPrincipal(r) {
   let best = null;
   for (const ws of r.presentations) {
-    if (!isOpen(ws)) continue;
+    if (!isOpen(ws) || !ws.meta.keyed) continue;
     if (!best) best = ws;
     else if (ws.meta.projector && (!best.meta.projector || ws.meta.joined > best.meta.joined)) best = ws;
     else if (!ws.meta.projector && !best.meta.projector && ws.meta.joined < best.meta.joined) best = ws;
@@ -252,12 +295,21 @@ function json(res, status, body) {
 }
 
 function pollRoom(req, res, code, url) {
+  const controller = url.searchParams.get("type") === "controller";
+  if (controller && !validKey(code, url.searchParams.get("k"))) return json(res, 401, { error: "control key required" });
+  // Audience polls never create rooms: a code nobody has opened answers
+  // "nothing yet" after a pause instead of costing memory for 12 hours.
+  if (!controller && !rooms.has(code)) {
+    const t = setTimeout(() => json(res, 200, { state: null }), 5000);
+    req.on("close", () => clearTimeout(t));
+    return;
+  }
   const r = room(code);
   const since = Number(url.searchParams.get("since") || 0);
   const ov = Number(url.searchParams.get("ov") || 0);
-  const controller = url.searchParams.get("type") === "controller";
   const reply = () => {
-    const body = { state: r.state, presence: presenceObj(r) };
+    // Presence (who holds a remote) is for remotes only.
+    const body = controller ? { state: r.state, presence: presenceObj(r) } : { state: r.state };
     if (controller && r.outline && ov !== r.outlineVersion) {
       body.outline = { slides: r.outline, version: r.outlineVersion };
     }
@@ -308,6 +360,7 @@ function postCmd(req, res, code) {
       return json(res, 400, { error: "bad json" });
     }
     if (!m || typeof m !== "object") return json(res, 400, { error: "bad json" });
+    if (!validKey(code, m.k)) return json(res, 401, { error: "control key required" });
     const who = typeof m.quien === "string" ? m.quien.slice(0, 24) : "";
     const ack = handleCmd(room(code), m, who);
     if (!ack) return json(res, 400, { error: "unknown action" });
@@ -319,7 +372,12 @@ function handleRelayHttp(req, res, url) {
   if (url.pathname === "/relay/health") return json(res, 200, { ok: true, rooms: rooms.size });
   const m = url.pathname.match(/^\/relay\/room\/([^/]+)(\/cmd)?$/);
   if (!m) return json(res, 404, { error: "not found" });
-  const code = decodeURIComponent(m[1]);
+  let code;
+  try {
+    code = decodeURIComponent(m[1]);
+  } catch {
+    return json(res, 400, { error: "bad cast code" });
+  }
   if (!CODE.test(code)) return json(res, 400, { error: "bad cast code" });
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
@@ -329,8 +387,12 @@ function handleRelayHttp(req, res, url) {
     });
     return res.end();
   }
-  if (httpLimited(req)) return json(res, 429, { error: "slow down" });
+  // Commands carry the key in their body and are checked there; the limit is
+  // for anonymous polls, so a crowd (or a flood) behind one address cannot
+  // lock the presenter out.
   if (m[2] && req.method === "POST") return postCmd(req, res, code);
+  const keyed = validKey(code, url.searchParams.get("k"));
+  if (!keyed && httpLimited(req)) return json(res, 429, { error: "slow down" });
   if (!m[2] && req.method === "GET") return pollRoom(req, res, code, url);
   json(res, 405, { error: "method not allowed" });
 }
@@ -345,7 +407,16 @@ const server = http.createServer((req, res) => {
     res.writeHead(400);
     return res.end();
   }
-  if (url.pathname.startsWith("/relay/")) return handleRelayHttp(req, res, url);
+  if (url.pathname.startsWith("/relay/")) {
+    try {
+      return handleRelayHttp(req, res, url);
+    } catch (err) {
+      console.error("relay http error:", err);
+      if (!res.headersSent) json(res, 500, { error: "internal" });
+      else res.destroy();
+      return;
+    }
+  }
   // Everything else goes to the Gleam server.
   const headers = { ...req.headers };
   headers["x-forwarded-host"] = headers["x-forwarded-host"] || req.headers.host || "";
@@ -384,11 +455,21 @@ server.on("upgrade", (req, socket, head) => {
     socket.destroy();
     return;
   }
+  const p = url.searchParams;
+  const kind = p.get("type") === "controller" ? "controller" : "presentation";
+  const keyed = validKey(code, p.get("k"));
   wss.handleUpgrade(req, socket, head, (ws) => {
-    const p = url.searchParams;
+    // Close code 4401 tells the remote to stop retrying and say why. If the
+    // peer never answers the close, terminate it rather than keep it around.
+    if (kind === "controller" && !keyed) {
+      ws.close(4401, "control key required");
+      setTimeout(() => ws.terminate(), 2000).unref();
+      return;
+    }
     ws.meta = {
       code,
-      kind: p.get("type") === "controller" ? "controller" : "presentation",
+      kind,
+      keyed,
       projector: p.get("rol") === "proyector" || p.get("rol") === "projector",
       who: (p.get("quien") || p.get("who") || "").replace(/[^\p{L}\p{N} ._-]/gu, "").slice(0, 24),
       joined: process.hrtime.bigint(),
@@ -472,6 +553,7 @@ wss.on("connection", (ws) => {
 // Heartbeat and cleanup.
 setInterval(() => {
   for (const ws of wss.clients) {
+    if (!ws.meta) continue; // never got a room (refused and closing)
     if (!ws.meta.alive) {
       ws.terminate();
       continue;
