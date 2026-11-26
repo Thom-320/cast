@@ -26,8 +26,8 @@ git clone <repository-url>
 cd cast
 nix run .
 
-# With custom WebSocket URL
-WEBSOCKET_URL='ws://your-domain/ws/' nix run .
+# Only if the relay lives on another host
+WEBSOCKET_URL='wss://your-domain/ws/' nix run .
 ```
 
 ## Manual Setup
@@ -56,11 +56,25 @@ gleam build
 ### Running
 
 ```bash
-# Start WebSocket relay (port 8080)
-node websocket_relay.js &
+# Gleam server (port 6767, internal)
+gleam run &
 
-# Start Gleam server (port 6767)
-gleam run
+# Relay: WebSocket at /ws/ and every other request proxied to Gleam
+node websocket_relay.js
+```
+
+Open `http://localhost:8080`. One port serves slides, remotes and the
+WebSocket, so a single tunnel or reverse-proxy rule is enough
+(`cloudflared tunnel --url http://localhost:8080`). `./start.sh` does both.
+
+On the screen everyone watches, open the presentation with `?proyector=1`
+(the URL in the upload result already has it). That window is the one the
+remotes drive; any other window with the same code follows it.
+
+### Tests
+
+```bash
+npm test   # simulated projector, stale tabs and phones against the relay
 ```
 
 ## HTML decks (manim-slides)
@@ -80,18 +94,42 @@ re-uploads. Phones can join at `/join`.
 
 | Variable | Description | Default |
 |----------|-------------|----------|
-| `WEBSOCKET_URL` | WebSocket server URL | `ws://localhost:8080` |
-| `SERVER_HOST` | Server bind address | `0.0.0.0` |
-| `SERVER_PORT` | Server port | `6767` |
+| `WEBSOCKET_URL` | Where browsers open the relay. Empty means same origin `/ws/` | empty |
+| `PUBLIC_URL` | Base URL in QR codes (e.g. `https://cast.example.com`). Empty means taken from the request (`X-Forwarded-*` aware) | empty |
+| `SERVER_HOST` | Gleam bind address | `0.0.0.0` |
+| `SERVER_PORT` | Gleam port | `6767` |
+| `CODES_FILE` | Cast codes survive restarts here | `./data/codes.tsv` |
+| `RELAY_PORT` | Relay port (HTTP + WebSocket) | `8080` |
+| `GLEAM_URL` | Where the relay proxies HTTP | `http://127.0.0.1:6767` |
+| `CAST_STATE_FILE` | Last slide of each room, survives relay restarts | `./relay-state.json` |
 | `SLIDES_DIR` | Slides output directory | `./slides` |
 | `VIEW_DIR` | Presentation HTML directory | `./view` |
 | `QR_DIR` | QR code directory | `./qr` |
 
-### Example: Custom WebSocket URL
+## How sync works
 
-```bash
-export WEBSOCKET_URL='ws://matwa.dev/ws/'
-gleam run
+The relay owns the slide state of each room (cast code):
+
+- Exactly one presentation is the **principal**: the newest one opened with
+  `?proyector=1`, or else the oldest one connected. Remote commands go only to
+  it and only its state counts. Every other window and every phone mirrors that
+  absolute state, so a forgotten tab can no longer drag the room around.
+- A principal that reloads (or a new one) resumes the room's slide instead of
+  slide 1.
+- Commands carry an id; repeats (double taps, resends after a reconnect) are
+  dropped, and the phone gets an `ack` saying whether a screen received it.
+  Phones show "Projector offline" when nothing is listening.
+- Heartbeat every 20 s (WebSocket ping plus `{type:"hb"}`); clients treat 45 s
+  of silence as a dead link and reconnect with backoff (1 s up to 10 s).
+- Codes are refused unless they match `[A-Za-z0-9_-]{1,32}`; a code already
+  owned by another presenter cannot be overwritten.
+
+Protocol (old clients still work):
+
+```
+remote       -> {type:"cmd", action:"next"|"prev"|"goto", indexh?, indexv?, id?}
+presentation -> {type:"state", indexh, indexv, indexf?, total}
+relay        -> state | {type:"rol", principal, state?} | presence | ack | hb
 ```
 
 ## Directory Structure
@@ -124,10 +162,9 @@ cast/
    - Serves static files
    - Manages cast codes via OTP actor
 
-2. **WebSocket Relay** (`websocket_relay.js`)
-   - WebSocket server on port 8080
-   - Routes messages between presentations and controllers
-   - Supports multiple concurrent presentations
+2. **Relay** (`websocket_relay.js`)
+   - One port (8080): WebSocket at `/ws/`, HTTP proxied to Gleam
+   - Keeps each room's state and picks the principal screen (see "How sync works")
 
 3. **Document Processor** (`src/document.gleam`)
    - Converts PDF to PNG using pdftoppm
@@ -136,6 +173,6 @@ cast/
    - Generates presentation HTML with Reveal.js
    - Creates QR codes using qrrs
 
- Controllers: `ws://host:8080/?cast_code={code}&type=controller`
-``
+Presentations: `ws://host:8080/ws/?cast_code={code}&type=presentation[&rol=proyector]`
+Controllers: `ws://host:8080/ws/?cast_code={code}&type=controller[&quien=name]`
 

@@ -30,7 +30,7 @@
           text = ''
             set -e
 
-            export WEBSOCKET_URL="''${WEBSOCKET_URL:-ws://localhost:8080}"
+            export WEBSOCKET_URL="''${WEBSOCKET_URL:-}"
 
             echo "🚀 Starting Cast via start.sh"
 

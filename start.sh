@@ -13,12 +13,13 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 # WebSocket URL - can be overridden via environment
-export WEBSOCKET_URL="${WEBSOCKET_URL:-ws://cast.matwa.dev/ws/}"
+# Empty means "same origin, /ws/": the relay below serves both HTTP and WebSocket.
+export WEBSOCKET_URL="${WEBSOCKET_URL:-}"
 
 npm i
 
 echo -e "${GREEN}🚀 Starting Cast Application${NC}"
-echo -e "${YELLOW}📡 WebSocket URL: $WEBSOCKET_URL${NC}"
+echo -e "${YELLOW}📡 WebSocket URL: ${WEBSOCKET_URL:-same origin /ws/}${NC}"
 echo ""
 
 # Function to cleanup on exit
@@ -35,7 +36,7 @@ cleanup() {
 trap cleanup SIGINT SIGTERM
 
 # Start WebSocket relay
-echo -e "${GREEN}▶️  Starting WebSocket relay on port 8080...${NC}"
+echo -e "${GREEN}▶️  Starting relay (HTTP + WebSocket) on port ${RELAY_PORT:-8080}...${NC}"
 node websocket_relay.js &
 WS_PID=$!
 echo "   PID: $WS_PID"
@@ -65,8 +66,8 @@ fi
 
 echo ""
 echo -e "${GREEN}✅ All services started successfully!${NC}"
-echo -e "${GREEN}   📱 Access at: http://localhost:6767${NC}"
-echo -e "${GREEN}   🔌 WebSocket at: $WEBSOCKET_URL${NC}"
+echo -e "${GREEN}   📱 Open: http://localhost:${RELAY_PORT:-8080}  (one port for slides, remotes and WebSocket)${NC}"
+echo -e "${GREEN}   🖥️  On the projector add ?proyector=1 to the presentation URL${NC}"
 echo ""
 echo -e "${YELLOW}Press Ctrl+C to stop all services${NC}"
 echo ""
