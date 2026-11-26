@@ -53,12 +53,22 @@ function url(c, query) {
 }
 
 // A deck window: mirrors the room when following, obeys commands when principal.
-function screen(c, { start = 0, total = 10, projector = false } = {}) {
-  const s = { i: start, principal: false, ws: null };
+// Like cast-remote.js it reports where next/prev would land; `delay` simulates
+// a slow projector (busy laptop, bad wifi).
+function screen(c, { start = 0, total = 10, projector = false, delay = 0 } = {}) {
+  const s = { i: start, principal: false, ws: null, got: [] };
   s.ws = new WebSocket(url(c, "type=presentation" + (projector ? "&rol=proyector" : "")));
-  const report = () => s.principal && s.ws.send(JSON.stringify({ type: "state", indexh: s.i, indexv: 0, total }));
+  const pos = (i) => ({ indexh: i, indexv: 0, indexf: -1 });
+  const report = () =>
+    s.principal &&
+    s.ws.send(JSON.stringify({
+      type: "state", indexh: s.i, indexv: 0, total,
+      next: s.i < total - 1 ? pos(s.i + 1) : null,
+      prev: s.i > 0 ? pos(s.i - 1) : null,
+    }));
   s.ws.on("message", (d) => {
     const m = JSON.parse(d);
+    s.got.push(m);
     if (m.type === "rol") {
       s.principal = m.principal;
       if (m.principal && m.state) s.i = m.state.indexh;
@@ -66,10 +76,12 @@ function screen(c, { start = 0, total = 10, projector = false } = {}) {
     } else if (m.type === "state" && !s.principal) {
       s.i = m.indexh;
     } else if (m.type === "cmd" && s.principal) {
-      if (m.action === "next") s.i = Math.min(total - 1, s.i + 1);
-      if (m.action === "prev") s.i = Math.max(0, s.i - 1);
-      if (m.action === "goto") s.i = m.indexh;
-      report();
+      setTimeout(() => {
+        if (m.action === "next") s.i = Math.min(total - 1, s.i + 1);
+        if (m.action === "prev") s.i = Math.max(0, s.i - 1);
+        if (m.action === "goto") s.i = m.indexh;
+        report();
+      }, delay);
     }
   });
   s.ready = new Promise((r) => s.ws.once("open", r));
@@ -77,11 +89,15 @@ function screen(c, { start = 0, total = 10, projector = false } = {}) {
 }
 
 function remote(c, query = "type=controller") {
-  const r = { seen: [], acks: [], presence: [], hb: 0 };
+  const r = { seen: [], states: [], acks: [], presence: [], outlines: [], hb: 0 };
   r.ws = new WebSocket(url(c, query));
   r.ws.on("message", (d) => {
     const m = JSON.parse(d);
-    if (m.type === "state") r.seen.push(m.indexh);
+    if (m.type === "state") {
+      r.seen.push(m.indexh);
+      r.states.push({ ...m, t: Date.now() });
+    }
+    if (m.type === "outline") r.outlines.push(m);
     if (m.type === "ack") r.acks.push(m);
     if (m.type === "presence") r.presence.push(m);
     if (m.type === "hb") r.hb++;
@@ -122,7 +138,9 @@ test("a stale tab no longer drags the room: everyone follows the projector", asy
   await sleep(150);
   assert.equal(proj.i, 9);
   assert.equal(stale.i, 9, "the other window mirrors the projector");
-  assert.deepEqual(r.seen, [4, 5, 6, 7, 8, 9], "the phone never jumps backwards");
+  // predicted and confirmed states repeat a slide, but never go back
+  const steps = r.seen.filter((x, k) => x !== r.seen[k - 1]);
+  assert.deepEqual(steps, [4, 5, 6, 7, 8, 9], "the phone never jumps backwards");
   for (const x of [proj, stale, r]) x.ws.close();
 });
 
@@ -277,4 +295,145 @@ test("the room's slide survives a relay restart", async () => {
   await sleep(100);
   assert.equal(back.seen[0], 7);
   back.ws.close();
+});
+
+function httpReq(method, path, body) {
+  return new Promise((res, rej) => {
+    const req = http.request(
+      { host: "127.0.0.1", port, method, path, headers: { "content-type": "text/plain" } },
+      (r) => {
+        let b = "";
+        r.on("data", (d) => (b += d));
+        r.on("end", () => res({ status: r.statusCode, headers: r.headers, body: b ? JSON.parse(b) : null }));
+      },
+    );
+    req.on("error", rej);
+    if (body) req.write(JSON.stringify(body));
+    req.end();
+  });
+}
+
+test("low latency: followers and the phone move before a slow projector answers", async () => {
+  const c = code();
+  const proj = screen(c, { start: 3, projector: true, delay: 400 });
+  await proj.ready;
+  const audience = screen(c);
+  await audience.ready;
+  const r = remote(c);
+  await r.ready;
+  await sleep(100);
+  const t0 = Date.now();
+  r.cmd("next", "fast1");
+  await sleep(150);
+  assert.equal(audience.i, 4, "the audience already shows the next slide");
+  const first = r.states.find((s) => s.indexh === 4);
+  assert.ok(first && first.predicted, "the phone got the predicted slide");
+  assert.ok(first.t - t0 < 150, `predicted after ${first.t - t0} ms`);
+  assert.equal(proj.i, 3, "the projector itself has not answered yet");
+  await sleep(450);
+  assert.equal(proj.i, 4);
+  const last = r.states.at(-1);
+  assert.equal(last.indexh, 4);
+  assert.ok(!last.predicted, "the projector confirmed it");
+  for (const x of [proj, audience, r]) x.ws.close();
+});
+
+test("a jump from the slide grid moves everyone at once", async () => {
+  const c = code();
+  const proj = screen(c, { projector: true, delay: 300 });
+  await proj.ready;
+  const audience = screen(c);
+  await audience.ready;
+  const r = remote(c);
+  await r.ready;
+  await sleep(80);
+  r.cmd("goto", "j1", { indexh: 8, indexv: 0 });
+  await sleep(100);
+  assert.equal(audience.i, 8);
+  await sleep(350);
+  assert.equal(proj.i, 8);
+  for (const x of [proj, audience, r]) x.ws.close();
+});
+
+test("speaker notes reach the remotes' teleprompter, never the other screens", async () => {
+  const c = code();
+  const proj = screen(c, { projector: true });
+  await proj.ready;
+  const audience = screen(c);
+  await audience.ready;
+  const early = remote(c);
+  await early.ready;
+  await sleep(60);
+  const slides = [
+    { h: 0, v: 0, title: "Hola", notes: "Saluda y presenta el tema" },
+    { h: 1, v: 0, title: "Datos", notes: "Cita la fuente: DANE 2025" },
+  ];
+  proj.ws.send(JSON.stringify({ type: "outline", slides }));
+  // a follower trying to replace the outline is ignored
+  audience.ws.send(JSON.stringify({ type: "outline", slides: [{ h: 0, v: 0, title: "x", notes: "hack" }] }));
+  await sleep(100);
+  assert.equal(early.outlines.length, 1);
+  assert.equal(early.outlines[0].slides[1].notes, "Cita la fuente: DANE 2025");
+  const late = remote(c);
+  await late.ready;
+  await sleep(80);
+  assert.equal(late.outlines[0].slides[0].title, "Hola", "a remote that joins later gets it too");
+  const leaked = [...proj.got, ...audience.got].some((m) => JSON.stringify(m).includes("DANE"));
+  assert.equal(leaked, false, "no screen receives the notes");
+  for (const x of [proj, audience, early, late]) x.ws.close();
+});
+
+test("HTTP fallback: a phone without WebSockets still follows and controls", async () => {
+  const c = code();
+  const proj = screen(c, { projector: true, start: 2 });
+  await proj.ready;
+  await sleep(80);
+  proj.ws.send(JSON.stringify({ type: "outline", slides: [{ h: 0, v: 0, title: "A", notes: "n" }] }));
+  await sleep(50);
+
+  const first = await httpReq("GET", `/relay/room/${c}?type=controller&since=0&ov=0`);
+  assert.equal(first.status, 200);
+  assert.equal(first.headers["access-control-allow-origin"], "*");
+  assert.equal(first.body.state.indexh, 2);
+  assert.equal(first.body.presence.projector, "explicit");
+  assert.equal(first.body.outline.slides[0].title, "A");
+
+  // a long poll waits for the next change instead of returning at once
+  const since = first.body.state.version;
+  const ov = first.body.outline.version;
+  const t0 = Date.now();
+  const waiting = httpReq("GET", `/relay/room/${c}?type=controller&since=${since}&ov=${ov}`);
+  await sleep(200);
+  const ack = await httpReq("POST", `/relay/room/${c}/cmd`, { action: "next", id: "h1" });
+  assert.deepEqual(ack.body, { type: "ack", id: "h1", delivered: true });
+  const woke = await waiting;
+  assert.ok(Date.now() - t0 < 1000, "the poll answered as soon as the slide changed");
+  assert.equal(woke.body.state.indexh, 3);
+  assert.equal(woke.body.outline, undefined, "the outline is not resent when unchanged");
+
+  const dup = await httpReq("POST", `/relay/room/${c}/cmd`, { action: "next", id: "h1" });
+  assert.equal(dup.body.duplicate, true);
+  await sleep(80);
+  assert.equal(proj.i, 3, "the resent command did not move twice");
+
+  assert.equal((await httpReq("GET", `/relay/room/bad%2Fcode?since=0`)).status, 400);
+  assert.equal((await httpReq("POST", `/relay/room/${c}/cmd`, { action: "explode" })).status, 400);
+  proj.ws.close();
+});
+
+test("HTTP fallback: an audience screen long-polls the projector's slide", async () => {
+  const c = code();
+  const proj = screen(c, { projector: true });
+  await proj.ready;
+  const r = remote(c);
+  await r.ready;
+  await sleep(80);
+  const v0 = (await httpReq("GET", `/relay/room/${c}?since=0`)).body.state.version;
+  const waiting = httpReq("GET", `/relay/room/${c}?since=${v0}`);
+  r.cmd("goto", "w1", { indexh: 5 });
+  const woke = await waiting;
+  assert.equal(woke.body.state.indexh, 5);
+  assert.equal(woke.body.outline, undefined, "screens never get the notes");
+  proj.ws.close();
+  r.ws.close();
 });
