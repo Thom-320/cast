@@ -10,6 +10,7 @@ import gleam/option
 import gleam/result
 import gleam/string
 import gleamyshell
+import notes
 import simplifile
 import store
 import types
@@ -72,7 +73,7 @@ pub fn handle_convert(req: wisp.Request, ctx: types.Context) -> wisp.Response {
     // another code may not overwrite it. Checked and claimed in one step.
     let given_key = list.key_find(formdata.values, "k") |> result.unwrap("")
     let key_ok = control.valid(ctx.secret, cast_code, string.trim(given_key))
-    use previous <- result.try(
+    use _ <- result.try(
       store.reserve(ctx.store, cast_code, username, filename, key_ok)
       |> result.map_error(fn(e) {
         case e {
@@ -83,18 +84,24 @@ pub fn handle_convert(req: wisp.Request, ctx: types.Context) -> wisp.Response {
     )
 
     use _ <- result.try(
-      case determine_filetype(filename) {
-        Pdf -> convert_pdf(filename, path, username, cast_code)
-        Pptx -> convert_pptx(filename, path, username, cast_code)
-        Html -> convert_html(filename, path, username, cast_code)
-        Unsupported -> Error(UnsupportedFileFormat)
-      }
-      |> result.map_error(fn(e) {
-        store.release(ctx.store, cast_code, previous)
-        e
+      store.while_reserved(ctx.store, cast_code, fn() {
+        use _ <- result.try(case determine_filetype(filename) {
+          Pdf -> convert_pdf(filename, path, username, cast_code)
+          Pptx -> convert_pptx(filename, path, username, cast_code)
+          Html -> convert_html(filename, path, username, cast_code)
+          Unsupported -> Error(UnsupportedFileFormat)
+        })
+        // The notes come out once, here, not on every audience visit.
+        notes.write_audience(username, view_filename(filename))
+        |> result.replace_error(
+          FailedGenerating([#("Failed to write the audience copy", "notes")]),
+        )
       }),
     )
-    store.set(ctx.store, username, filename, cast_code)
+    use _ <- result.try(
+      store.set(ctx.store, username, filename, cast_code)
+      |> result.replace_error(CodeTaken),
+    )
 
     use _ <- result.try(
       generate_qr_code(
@@ -265,6 +272,7 @@ fn convert_html(
   case simplifile.read(path) {
     Error(_) -> fail("Failed to read uploaded HTML")
     Ok(html) -> {
+      let html = notes.unremote(html)
       let tag = remote_script_tag(cast_code)
       let html = case string.split(html, "</body>") |> list.reverse {
         [last, ..rest] if rest != [] ->

@@ -95,8 +95,8 @@ fn serve_view_page(
   let safe_username = string.replace(username, "..", "")
   let safe_filename = string.replace(filename, "..", "")
   let html_path = "./view/" <> safe_username <> "/" <> safe_filename
-  case simplifile.read(html_path) {
-    Ok(content) -> {
+  case simplifile.is_file(html_path) {
+    Ok(True) -> {
       // The store says which code owns this deck; only its key counts.
       let code = store.owner_of(ctx.store, safe_username, safe_filename)
       let from_query = case code {
@@ -110,24 +110,42 @@ fn serve_view_page(
         None -> False
       }
       let res = case code, from_query || from_cookie {
-        Some(c), True -> {
-          let key = control.key(ctx.secret, c)
-          let tag = "data-cast-code='" <> c <> "'"
-          string.replace(content, tag, tag <> " data-cast-key='" <> key <> "'")
-          |> wisp.html_response(200)
-          // The raw (still percent-encoded) path, as the browser compares it.
-          |> set_deck_cookie(req, req.path, key)
-        }
-        _, _ -> wisp.html_response(notes.strip(content), 200)
+        Some(c), True ->
+          case simplifile.read(html_path) {
+            Ok(content) -> {
+              let key = control.key(ctx.secret, c)
+              let tag = "data-cast-code='" <> c <> "'"
+              string.replace(
+                content,
+                tag,
+                tag <> " data-cast-key='" <> key <> "'",
+              )
+              |> wisp.html_response(200)
+              // The raw (still percent-encoded) path, as the browser compares it.
+              |> set_deck_cookie(req, req.path, key)
+            }
+            Error(_) -> wisp.internal_server_error()
+          }
+        // The audience copy, notes already out (made at upload).
+        _, _ ->
+          case notes.audience_file(safe_username, safe_filename) {
+            Ok(path) ->
+              wisp.response(200)
+              |> wisp.set_header("content-type", "text/html; charset=utf-8")
+              |> wisp.set_body(wisp.File(path:, offset: 0, limit: None))
+            Error(_) -> wisp.internal_server_error()
+          }
       }
       res
       |> private_page
       |> wisp.set_header(
         "content-security-policy",
-        "sandbox allow-scripts allow-popups allow-modals allow-presentation allow-downloads",
+        "sandbox allow-scripts allow-popups allow-modals allow-presentation allow-downloads; frame-ancestors 'none'",
       )
+      // No other page can frame the deck or keep a handle on its window.
+      |> wisp.set_header("cross-origin-opener-policy", "same-origin")
     }
-    Error(_) -> wisp.html_response("Presentation not found", 404)
+    _ -> wisp.html_response("Presentation not found", 404)
   }
 }
 
