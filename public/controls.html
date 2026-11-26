@@ -2,7 +2,10 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta content="width=device-width, initial-scale=1.0" name="viewport" />
+    <meta content="width=device-width, initial-scale=1.0, viewport-fit=cover" name="viewport" />
+    <meta name="theme-color" content="#1b3331" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
     <title>Cast - Mobile Remote Controls</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -12,120 +15,217 @@
     />
     <link rel="stylesheet" href="/assets/spot.css" />
     <style>
-      .page {
-        max-width: 480px;
-        min-height: 100vh;
-        gap: var(--space-4);
-        padding-top: var(--space-4);
-        padding-bottom: var(--space-4);
-      }
-      header {
+      html, body { height: 100%; }
+      body { overscroll-behavior: none; }
+      .app {
+        box-sizing: border-box;
+        max-width: 560px;
+        margin: 0 auto;
+        height: 100vh;
+        height: 100dvh;
         display: flex;
-        align-items: baseline;
-        justify-content: space-between;
-        gap: var(--space-3);
+        flex-direction: column;
+        gap: var(--space-2);
+        padding: max(var(--space-2), env(safe-area-inset-top)) var(--space-3)
+          max(var(--space-2), env(safe-area-inset-bottom));
       }
-      .status {
-        display: inline-flex;
+      .bar {
+        display: flex;
         align-items: center;
+        justify-content: space-between;
         gap: var(--space-2);
       }
-      .status[data-status="connecting"] .dot {
-        animation: blink 1s steps(2, start) infinite;
-      }
-      .status[data-status="connected"] .dot {
-        background: var(--ink);
-      }
+      .status { display: inline-flex; align-items: center; gap: var(--space-2); }
+      .status[data-status="connecting"] .dot { animation: blink 1s steps(2, start) infinite; }
+      .status[data-status="connected"] .dot { background: var(--ink); }
       .status[data-status="disconnected"] .dot,
-      .status[data-status="noprojector"] .dot,
-      .status[data-status="error"] .dot {
+      .status[data-status="noprojector"] .dot {
         background: var(--accent);
         border-color: var(--accent);
       }
-      @keyframes blink {
-        to { visibility: hidden; }
+      @keyframes blink { to { visibility: hidden; } }
+      .chip {
+        font: 700 14px/20px var(--font-mono);
+        padding: var(--space-1) var(--space-2);
+        border: 1px solid var(--ink);
+        background: transparent;
+        color: var(--ink);
+        min-height: 36px;
       }
-      .counter {
-        display: flex;
-        align-items: baseline;
-        gap: var(--space-2);
+      .chip[aria-pressed="true"] { background: var(--ink); color: var(--on-ink); }
+
+      /* Teleprompter */
+      .prompter {
+        flex: 1 1 40%;
+        min-height: 96px;
+        overflow-y: auto;
+        -webkit-overflow-scrolling: touch;
+        border-top: 1px solid var(--ink);
+        border-bottom: 1px solid var(--ink);
+        padding: var(--space-2) 0;
       }
-      .counter__total {
-        font-size: 22px;
-        line-height: 30px;
+      .prompter__title { margin: 0 0 var(--space-2); }
+      .prompter__notes {
+        margin: 0;
+        white-space: pre-wrap;
+        font-family: var(--font-display);
+        font-size: var(--notes-size, 24px);
+        line-height: 1.35;
         font-weight: 600;
       }
-      .remote {
-        flex-grow: 1;
+      .prompter__notes.empty { opacity: 0.45; font-weight: 400; }
+      .size { display: inline-flex; gap: var(--space-1); }
+
+      /* Where we are */
+      .where {
+        display: flex;
+        align-items: center;
+        gap: var(--space-3);
+        min-height: 56px;
+      }
+      .counter {
+        border: 1px solid var(--ink);
+        background: transparent;
+        color: var(--ink);
+        padding: var(--space-1) var(--space-3);
+        display: inline-flex;
+        align-items: baseline;
+        gap: var(--space-1);
+        font-family: var(--font-display);
+        min-height: 56px;
+        transition: opacity 0.1s;
+      }
+      .counter.pending { opacity: 0.45; }
+      .counter__now { font-size: 36px; line-height: 44px; font-weight: 800; }
+      .counter__total { font-size: 18px; font-weight: 600; }
+      .upnext { flex: 1; min-width: 0; }
+      .upnext p { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+      /* The whole pad is the button: left third back, the rest forward. */
+      .pad {
+        flex: 1 1 45%;
+        min-height: 180px;
+        display: grid;
+        grid-template-columns: 1fr 2fr;
+        gap: var(--space-2);
+        touch-action: none;
+        user-select: none;
+        -webkit-user-select: none;
+        -webkit-touch-callout: none;
+      }
+      .zone {
         display: flex;
         flex-direction: column;
-        gap: var(--space-3);
+        align-items: center;
+        justify-content: center;
+        gap: var(--space-1);
+        border: 1px solid var(--ink);
+        font-family: var(--font-display);
+        font-weight: 800;
+        transition: background 0.08s, color 0.08s;
       }
-      #nextBtn {
-        flex-grow: 1;
-        min-height: 160px;
-        font-size: 22px;
-        line-height: 30px;
+      .zone--next { background: var(--ink); color: var(--on-ink); font-size: 56px; }
+      .zone--prev { font-size: 36px; }
+      .zone.flash { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+      .pad.disabled .zone { opacity: 0.4; }
+      .foot { display: flex; justify-content: space-between; align-items: center; gap: var(--space-2); }
+      .foot .meta { margin: 0; }
+
+      /* Slide grid */
+      .grid {
+        position: fixed;
+        inset: 0;
+        z-index: 10;
+        background: var(--paper);
+        display: none;
+        flex-direction: column;
+        padding: max(var(--space-3), env(safe-area-inset-top)) var(--space-3) var(--space-3);
+        gap: var(--space-2);
       }
-      #prevBtn {
-        min-height: 96px;
+      .grid.open { display: flex; }
+      .grid__list {
+        flex: 1;
+        overflow-y: auto;
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+        gap: var(--space-2);
+        align-content: start;
       }
+      .grid__item {
+        text-align: left;
+        border: 1px solid var(--ink);
+        background: transparent;
+        color: var(--ink);
+        padding: var(--space-2);
+        min-height: 64px;
+        font-family: var(--font-display);
+      }
+      .grid__item b { display: block; font-size: 20px; }
+      .grid__item span { display: block; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .grid__item.current { background: var(--ink); color: var(--on-ink); }
     </style>
   </head>
   <body>
-    <main class="page">
-      <header>
-        <h1 class="spot-hero spot-hero--3">cast</h1>
+    <main class="app">
+      <div class="bar">
         <span class="status" id="connectionStatus" data-status="connecting">
           <span class="dot"></span>
           <span class="spot-label" id="statusText">Connecting</span>
         </span>
-      </header>
-
-      <div class="spot-frame">
-        <div class="spot-frame__in"></div>
-        <span class="spot-label">Slide</span>
-        <p class="counter">
-          <span id="currentSlide" class="spot-hero spot-hero--2">1</span>
-          <span class="counter__total">/ <span id="totalSlides">?</span></span>
-        </p>
+        <button class="chip" id="timer" type="button" aria-pressed="false" title="Tap: start/pause · hold: reset">
+          0:00
+        </button>
       </div>
 
-      <section class="remote">
-        <button
-          id="nextBtn"
-          class="spot-button spot-button--solid spot-button--block"
-          type="button"
-        >
-          Next →
-        </button>
-        <button
-          id="prevBtn"
-          class="spot-button spot-button--block"
-          type="button"
-        >
-          ← Previous
-        </button>
+      <section class="prompter" aria-label="Speaker notes">
+        <div class="bar">
+          <p class="spot-label prompter__title" id="slideTitle">Notes</p>
+          <span class="size">
+            <button class="chip" id="smaller" type="button" aria-label="Smaller notes">A−</button>
+            <button class="chip" id="bigger" type="button" aria-label="Bigger notes">A+</button>
+          </span>
+        </div>
+        <p class="prompter__notes empty" id="notes">Speaker notes from the deck show up here.</p>
       </section>
 
-      <footer style="display: flex; flex-direction: column; gap: var(--space-3)">
-        <button
-          class="spot-button spot-button--block"
-          type="button"
-          id="stopBtn"
-        >
-          ■ Leave Remote
+      <div class="where">
+        <button class="counter" id="counter" type="button" aria-label="Jump to a slide">
+          <span class="counter__now" id="currentSlide">–</span>
+          <span class="counter__total">/ <span id="totalSlides">?</span></span>
         </button>
+        <div class="upnext">
+          <p class="meta">Next</p>
+          <p id="nextTitle">–</p>
+        </div>
+      </div>
+
+      <div class="pad disabled" id="pad" role="group" aria-label="Tap right for next, left for previous, or swipe">
+        <div class="zone zone--prev" id="prevZone" role="button" aria-label="Previous slide">←</div>
+        <div class="zone zone--next" id="nextZone" role="button" aria-label="Next slide">→</div>
+      </div>
+
+      <div class="foot">
         <p class="meta" id="presence" aria-live="polite"></p>
-        <p class="meta">Presentation by {{USERNAME}}</p>
-      </footer>
+        <button class="chip" type="button" id="stopBtn">Leave</button>
+      </div>
+      <p class="meta" style="margin: 0">Presentation by {{USERNAME}} <span id="awake"></span></p>
     </main>
+
+    <div class="grid" id="grid" role="dialog" aria-label="Jump to a slide">
+      <div class="bar">
+        <span class="spot-label">Jump to slide</span>
+        <button class="chip" id="gridClose" type="button">Close</button>
+      </div>
+      <div class="grid__list" id="gridList"></div>
+    </div>
+
     <script>
       (function () {
         const castCode = "{{CAST_CODE}}";
         const configured = "{{WS_URL}}";
         const params = new URLSearchParams(location.search);
         const who = (params.get("quien") || params.get("who") || "").slice(0, 24);
+        const $ = (id) => document.getElementById(id);
 
         function relayBase() {
           if (configured && !configured.startsWith("{{")) return configured.replace(/\?.*$/, "");
@@ -134,33 +234,50 @@
           const host = location.port === "6767" ? location.hostname + ":8080" : location.host;
           return proto + host + "/ws/";
         }
+        const BASE = relayBase();
         const WS_URL =
-          relayBase() + "?cast_code=" + encodeURIComponent(castCode) + "&type=controller" +
+          BASE + "?cast_code=" + encodeURIComponent(castCode) + "&type=controller" +
           (who ? "&quien=" + encodeURIComponent(who) : "");
+        const HTTP_URL =
+          BASE.replace(/^ws/, "http").replace(/\/ws\/?$|\/$/, "") + "/relay/room/" + encodeURIComponent(castCode);
 
-        const statusLabels = {
-          connecting: "Connecting",
-          connected: "Connected",
-          disconnected: "Reconnecting",
-          noprojector: "Projector offline",
+        const store = {
+          get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+          set(k, v) { try { localStorage.setItem(k, v); } catch {} },
         };
 
         let socket = null;
         let lastHeard = 0;
         let retry = 0;
+        let failures = 0;
+        let polling = false;
         let projector = "none";
+        let state = null;
+        let slides = []; // outline: [{h, v, title, notes}]
+        let outlineVersion = 0;
+        let rtt = null;
         const pending = new Map(); // id -> {msg, sent}
 
-        function updateConnectionStatus(status) {
-          document.getElementById("connectionStatus").dataset.status = status;
-          document.getElementById("statusText").textContent = statusLabels[status];
-          const disabled = status === "connecting" || status === "disconnected";
-          document.getElementById("nextBtn").disabled = disabled;
-          document.getElementById("prevBtn").disabled = disabled;
+        const wsOpen = () => socket && socket.readyState === WebSocket.OPEN;
+
+        // ---------------------------------------------------------- status
+        const labels = {
+          connecting: "Connecting",
+          connected: "Connected",
+          disconnected: "Reconnecting",
+          noprojector: "Projector offline",
+        };
+        function setStatus(kind) {
+          $("connectionStatus").dataset.status = kind;
+          let text = labels[kind];
+          if (kind === "connected" && polling) text += " · HTTP";
+          if (kind === "connected" && rtt !== null) text += " · " + rtt + " ms";
+          $("statusText").textContent = text;
+          $("pad").classList.toggle("disabled", kind === "connecting" || kind === "disconnected");
         }
         function showLinkState() {
-          if (!socket || socket.readyState !== WebSocket.OPEN) return;
-          updateConnectionStatus(projector === "none" ? "noprojector" : "connected");
+          if (!wsOpen() && !polling) return;
+          setStatus(projector === "none" ? "noprojector" : "connected");
         }
         function presenceText(p) {
           const others = p.controllers.filter(Boolean);
@@ -168,16 +285,116 @@
           const remotes = others.length === 1 ? "1 remote" : others.length + " remotes";
           return (p.projector === "none" ? "No projector connected" : screens) + " · " + remotes;
         }
+        function onPresence(p) {
+          projector = p.projector;
+          $("presence").textContent = presenceText(p);
+          showLinkState();
+        }
 
+        // ---------------------------------------------------------- slide + teleprompter
+        function slideIndex(h, v) {
+          return slides.findIndex((s) => s.h === h && s.v === (v || 0));
+        }
+        function render() {
+          if (state) {
+            $("currentSlide").textContent = state.indexh + 1 + (state.indexv ? "." + state.indexv : "");
+            $("totalSlides").textContent = state.total || "?";
+          }
+          $("counter").classList.toggle("pending", pending.size > 0);
+          const k = state ? slideIndex(state.indexh, state.indexv) : -1;
+          const cur = k >= 0 ? slides[k] : null;
+          const nxt = k >= 0 ? slides[k + 1] : null;
+          $("slideTitle").textContent = cur && cur.title ? cur.title : "Notes";
+          const notes = $("notes");
+          if (cur && cur.notes) {
+            if (notes.textContent !== cur.notes) {
+              notes.textContent = cur.notes;
+              notes.parentElement.scrollTop = 0;
+            }
+            notes.classList.remove("empty");
+          } else {
+            notes.textContent = slides.length
+              ? "No notes on this slide."
+              : "Speaker notes from the deck show up here.";
+            notes.classList.add("empty");
+          }
+          $("nextTitle").textContent = nxt ? (nxt.title || "Slide " + (nxt.h + 1)) : k >= 0 ? "End" : "–";
+          if ($("grid").classList.contains("open")) renderGrid();
+        }
+        function onState(s) {
+          // Ignore anything older than what we already show.
+          // (`at` is the relay's clock, so this also survives a relay restart.)
+          if (state && typeof s.at === "number" && typeof state.at === "number" && s.at < state.at) return;
+          state = s;
+          render();
+        }
+        function onOutline(o) {
+          slides = Array.isArray(o.slides) ? o.slides : [];
+          outlineVersion = o.version || 0;
+          render();
+        }
+
+        // ---------------------------------------------------------- slide grid
+        function renderGrid() {
+          const list = $("gridList");
+          list.textContent = "";
+          const entries = slides.length
+            ? slides
+            : Array.from({ length: (state && state.total) || 0 }, (_, h) => ({ h, v: 0, title: "" }));
+          for (const s of entries) {
+            const b = document.createElement("button");
+            b.type = "button";
+            b.className = "grid__item";
+            if (state && state.indexh === s.h && (state.indexv || 0) === s.v) b.classList.add("current");
+            const n = document.createElement("b");
+            n.textContent = s.h + 1 + (s.v ? "." + s.v : "");
+            const t = document.createElement("span");
+            t.textContent = s.title || "Slide " + (s.h + 1);
+            b.append(n, t);
+            b.addEventListener("click", () => {
+              sendCommand("goto", { indexh: s.h, indexv: s.v });
+              $("grid").classList.remove("open");
+            });
+            list.appendChild(b);
+          }
+          const cur = list.querySelector(".current");
+          if (cur) cur.scrollIntoView({ block: "center" });
+        }
+        $("counter").addEventListener("click", () => {
+          $("grid").classList.add("open");
+          renderGrid();
+        });
+        $("gridClose").addEventListener("click", () => $("grid").classList.remove("open"));
+
+        // ---------------------------------------------------------- messages
+        function handle(data) {
+          if (data.type === "state") onState(data);
+          else if (data.type === "outline") onOutline(data);
+          else if (data.type === "presence") onPresence(data);
+          else if (data.type === "ack") {
+            const p = pending.get(data.id);
+            if (p) rtt = Date.now() - p.sent;
+            pending.delete(data.id);
+            if (!data.delivered) $("presence").textContent = "Not sent: no projector connected";
+            render();
+            showLinkState();
+          }
+        }
+
+        // ---------------------------------------------------------- WebSocket
         function connect() {
-          updateConnectionStatus("connecting");
+          if (!polling) setStatus("connecting");
           const ws = new WebSocket(WS_URL);
           socket = ws;
+          let opened = false;
 
           ws.onopen = () => {
+            opened = true;
             retry = 0;
+            failures = 0;
             lastHeard = Date.now();
             showLinkState();
+            keepAwake();
             // Commands that never got an ack are resent with the same id:
             // the relay drops repeats, so a retry can never advance twice.
             const now = Date.now();
@@ -186,59 +403,180 @@
               else ws.send(JSON.stringify(p.msg));
             }
           };
-
           ws.onmessage = (event) => {
             lastHeard = Date.now();
             let data;
             try { data = JSON.parse(event.data); } catch { return; }
-            if (data.type === "state") {
-              document.getElementById("currentSlide").textContent = data.indexh + 1;
-              document.getElementById("totalSlides").textContent = data.total || "?";
-            } else if (data.type === "presence") {
-              projector = data.projector;
-              document.getElementById("presence").textContent = presenceText(data);
-              showLinkState();
-            } else if (data.type === "ack") {
-              pending.delete(data.id);
-              if (!data.delivered) document.getElementById("presence").textContent =
-                "Not sent: no projector connected";
-            }
+            handle(data);
           };
-
           ws.onclose = () => {
             if (socket !== ws) return;
-            updateConnectionStatus("disconnected");
+            if (!opened && ++failures >= 2) pollLoop();
+            if (!polling) setStatus("disconnected");
             const wait = Math.min(10000, 1000 * 2 ** retry++) * (0.75 + Math.random() / 2);
             setTimeout(connect, wait);
           };
           ws.onerror = () => {};
         }
 
+        // ---------------------------------------------------------- HTTP fallback
+        // Networks that block WebSockets still allow plain requests: long-poll
+        // the room and POST commands until the WebSocket comes back.
+        async function pollLoop() {
+          if (polling) return;
+          polling = true;
+          showLinkState();
+          while (!wsOpen()) {
+            try {
+              const since = state && typeof state.version === "number" ? state.version : 0;
+              const res = await fetch(
+                HTTP_URL + "?type=controller&since=" + since + "&ov=" + outlineVersion,
+                { cache: "no-store" },
+              );
+              const body = await res.json();
+              if (body.outline) onOutline(body.outline);
+              if (body.presence) onPresence(body.presence);
+              if (body.state) onState({ type: "state", ...body.state });
+              showLinkState();
+            } catch {
+              await new Promise((r) => setTimeout(r, 2000));
+            }
+          }
+          polling = false;
+          showLinkState();
+        }
+        async function postCommand(msg) {
+          try {
+            const res = await fetch(HTTP_URL + "/cmd", {
+              method: "POST",
+              // text/plain keeps it a simple request: no CORS preflight round trip.
+              headers: { "content-type": "text/plain" },
+              body: JSON.stringify({ ...msg, quien: who }),
+            });
+            handle(await res.json());
+          } catch {
+            // stays pending; resent when a connection comes back
+          }
+        }
+
         // The relay speaks every 20 s; 45 s of silence means a dead link.
         setInterval(() => {
-          if (socket && socket.readyState === WebSocket.OPEN && Date.now() - lastHeard > 45000) socket.close();
+          if (wsOpen() && Date.now() - lastHeard > 45000) socket.close();
         }, 5000);
         document.addEventListener("visibilitychange", () => {
           if (document.visibilityState !== "visible") return;
-          if (socket && socket.readyState === WebSocket.OPEN) socket.send('{"type":"hb"}');
+          keepAwake();
+          if (wsOpen()) socket.send('{"type":"hb"}');
           else if (!socket || socket.readyState === WebSocket.CLOSED) connect();
         });
 
-        function sendCommand(action) {
-          const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-          const msg = { type: "cmd", action, id };
-          pending.set(id, { msg, sent: Date.now() });
-          if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(msg));
-          if (navigator.vibrate) navigator.vibrate(15);
+        // ---------------------------------------------------------- screen awake
+        let wakeLock = null;
+        async function keepAwake() {
+          if (!("wakeLock" in navigator)) {
+            $("awake").textContent = "· keep the screen on";
+            return;
+          }
+          if (wakeLock || document.visibilityState !== "visible") return;
+          try {
+            wakeLock = await navigator.wakeLock.request("screen");
+            $("awake").textContent = "· screen stays on";
+            wakeLock.addEventListener("release", () => (wakeLock = null));
+          } catch {
+            $("awake").textContent = "· keep the screen on";
+          }
         }
 
-        document.getElementById("nextBtn").addEventListener("click", () => sendCommand("next"));
-        document.getElementById("prevBtn").addEventListener("click", () => sendCommand("prev"));
-        document.addEventListener("keydown", (e) => {
-          if (["ArrowRight", "PageDown", " "].includes(e.key)) { e.preventDefault(); sendCommand("next"); }
-          if (["ArrowLeft", "PageUp"].includes(e.key)) { e.preventDefault(); sendCommand("prev"); }
+        // ---------------------------------------------------------- commands
+        function sendCommand(action, extra) {
+          const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+          const msg = { type: "cmd", action, id, ...(extra || {}) };
+          pending.set(id, { msg, sent: Date.now() });
+          if (wsOpen()) socket.send(JSON.stringify(msg));
+          else if (polling) postCommand(msg);
+          if (navigator.vibrate) navigator.vibrate(12);
+          startTimer();
+          keepAwake();
+          render(); // the counter dims until the room confirms
+        }
+
+        function flash(el) {
+          el.classList.add("flash");
+          setTimeout(() => el.classList.remove("flash"), 120);
+        }
+        function go(action) {
+          if ($("pad").classList.contains("disabled")) return;
+          flash(action === "next" ? $("nextZone") : $("prevZone"));
+          sendCommand(action);
+        }
+
+        // Tap: left third = back, rest = forward. Swipe left = forward, right = back.
+        let down = null;
+        $("pad").addEventListener("pointerdown", (e) => {
+          down = { x: e.clientX, y: e.clientY };
         });
-        document.getElementById("stopBtn").addEventListener("click", () => {
+        $("pad").addEventListener("pointerup", (e) => {
+          if (!down) return;
+          const dx = e.clientX - down.x;
+          const dy = e.clientY - down.y;
+          down = null;
+          if (Math.abs(dx) > 40 && Math.abs(dx) > Math.abs(dy)) return go(dx < 0 ? "next" : "prev");
+          const box = $("pad").getBoundingClientRect();
+          go(e.clientX - box.left < box.width / 3 ? "prev" : "next");
+        });
+        $("pad").addEventListener("pointercancel", () => (down = null));
+
+        document.addEventListener("keydown", (e) => {
+          if (["ArrowRight", "PageDown", " "].includes(e.key)) { e.preventDefault(); go("next"); }
+          if (["ArrowLeft", "PageUp"].includes(e.key)) { e.preventDefault(); go("prev"); }
+        });
+
+        // ---------------------------------------------------------- notes size
+        let size = Number(store.get("cast-notes-size")) || 24;
+        function applySize() {
+          document.documentElement.style.setProperty("--notes-size", size + "px");
+          store.set("cast-notes-size", String(size));
+        }
+        $("smaller").addEventListener("click", () => { size = Math.max(14, size - 3); applySize(); });
+        $("bigger").addEventListener("click", () => { size = Math.min(56, size + 3); applySize(); });
+        applySize();
+
+        // ---------------------------------------------------------- timer
+        let started = null;
+        let elapsed = 0;
+        function startTimer() {
+          if (started === null && elapsed === 0) {
+            started = Date.now();
+            $("timer").setAttribute("aria-pressed", "true");
+          }
+        }
+        function showTimer() {
+          const t = Math.floor((elapsed + (started ? Date.now() - started : 0)) / 1000);
+          $("timer").textContent = Math.floor(t / 60) + ":" + String(t % 60).padStart(2, "0");
+        }
+        setInterval(showTimer, 500);
+        let holdTimer = null;
+        let held = false;
+        $("timer").addEventListener("pointerdown", () => {
+          held = false;
+          holdTimer = setTimeout(() => {
+            held = true;
+            started = null;
+            elapsed = 0;
+            $("timer").setAttribute("aria-pressed", "false");
+            showTimer();
+          }, 700);
+        });
+        $("timer").addEventListener("pointerup", () => clearTimeout(holdTimer));
+        $("timer").addEventListener("click", () => {
+          if (held) return;
+          if (started) { elapsed += Date.now() - started; started = null; }
+          else started = Date.now();
+          $("timer").setAttribute("aria-pressed", started ? "true" : "false");
+          showTimer();
+        });
+
+        $("stopBtn").addEventListener("click", () => {
           if (confirm("Leave the remote?")) {
             if (socket) socket.close();
             window.location.href = "/";

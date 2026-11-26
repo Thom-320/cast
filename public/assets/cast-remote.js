@@ -5,6 +5,7 @@
 //
 // Open the deck with ?proyector=1 on the screen everyone watches: that window is
 // the one the remotes drive. Any other window with the same code just follows it.
+// Speaker notes (<aside class="notes">) go to the remote's teleprompter only.
 (function () {
   const script = document.currentScript;
   const castCode = script.dataset.castCode;
@@ -20,11 +21,15 @@
     const host = location.port === "6767" ? location.hostname + ":8080" : location.host;
     return proto + host + "/ws/";
   }
+  const BASE = relayBase();
   const WS_URL =
-    relayBase() +
+    BASE +
     "?cast_code=" + encodeURIComponent(castCode) +
     "&type=presentation" +
     (wantsProjector ? "&rol=proyector" : "");
+  // Same host as the WebSocket, plain HTTP: used when WebSockets are blocked.
+  const HTTP_URL =
+    BASE.replace(/^ws/, "http").replace(/\/ws\/?$|\/$/, "") + "/relay/room/" + encodeURIComponent(castCode);
 
   const style = document.createElement("style");
   style.textContent = `
@@ -59,6 +64,9 @@
   let applying = false; // true while we move Reveal because the relay told us to
   let lastHeard = 0;
   let retry = 0;
+  let failures = 0; // WebSocket attempts in a row that never opened
+  let polling = false;
+  let lastVersion = 0;
   let hideTimeout = null;
 
   function status(kind, text) {
@@ -73,20 +81,98 @@
     return principal ? "Remote active · projector" : "Following the projector";
   }
 
+  // ------------------------------------------------------------ screen awake
+  // A laptop or phone that dims and sleeps also drops the connection.
+  let wakeLock = null;
+  async function keepAwake() {
+    if (!("wakeLock" in navigator) || document.visibilityState !== "visible" || wakeLock) return;
+    try {
+      wakeLock = await navigator.wakeLock.request("screen");
+      wakeLock.addEventListener("release", () => (wakeLock = null));
+    } catch {
+      wakeLock = null; // not allowed here (no https, battery saver...)
+    }
+  }
+
   function send(msg) {
     if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(msg));
+  }
+
+  // ------------------------------------------------------------ where next/prev land
+  // Mirrors Reveal.next()/prev(): fragment, then down, then right (or back).
+  function maxFragment(slide) {
+    let max = -1;
+    if (!slide) return max;
+    for (const el of slide.querySelectorAll(".fragment[data-fragment-index]")) {
+      max = Math.max(max, Number(el.getAttribute("data-fragment-index")) || 0);
+    }
+    return max;
+  }
+  function routes(i) {
+    const f = typeof i.f === "number" ? i.f : -1;
+    const frags = Reveal.availableFragments();
+    const r = Reveal.availableRoutes();
+    let next = null;
+    let prev = null;
+    if (frags.next) next = { indexh: i.h, indexv: i.v || 0, indexf: f + 1 };
+    else if (r.down) next = { indexh: i.h, indexv: (i.v || 0) + 1, indexf: -1 };
+    else if (r.right) next = { indexh: i.h + 1, indexv: 0, indexf: -1 };
+    if (frags.prev) prev = { indexh: i.h, indexv: i.v || 0, indexf: f - 1 };
+    else if (r.up) {
+      const above = Reveal.getSlide(i.h, (i.v || 0) - 1);
+      prev = { indexh: i.h, indexv: (i.v || 0) - 1, indexf: maxFragment(above) };
+    } else if (r.left) {
+      const stack = Reveal.getHorizontalSlides()[i.h - 1];
+      // Going back into a vertical stack lands on a slide we cannot guess cheaply.
+      if (stack && !stack.querySelector("section")) {
+        prev = { indexh: i.h - 1, indexv: 0, indexf: maxFragment(stack) };
+      }
+    }
+    return { next, prev };
   }
 
   function reportState() {
     if (!principal || applying) return;
     const i = Reveal.getIndices();
+    const { next, prev } = routes(i);
     send({
       type: "state",
       indexh: i.h,
       indexv: i.v || 0,
       indexf: typeof i.f === "number" ? i.f : -1,
       total: Reveal.getTotalSlides(),
+      next,
+      prev,
     });
+  }
+
+  // ------------------------------------------------------------ teleprompter outline
+  function notesText(slide) {
+    const html = Reveal.getSlideNotes(slide);
+    if (!html) return "";
+    const doc = new DOMParser().parseFromString(
+      String(html).replace(/<br\s*\/?>/gi, "\n").replace(/<\/(p|li|div|h\d)>/gi, "\n"),
+      "text/html",
+    );
+    return (doc.body.textContent || "").replace(/\n{3,}/g, "\n\n").trim();
+  }
+  function outline() {
+    return Reveal.getSlides().map((slide) => {
+      const i = Reveal.getIndices(slide);
+      const heading = slide.querySelector("h1, h2, h3");
+      const title = (heading ? heading.textContent : slide.getAttribute("data-title") || "")
+        .replace(/\s+/g, " ")
+        .trim();
+      return { h: i.h, v: i.v || 0, title, notes: notesText(slide) };
+    });
+  }
+  function sendOutline() {
+    if (!principal) return;
+    try {
+      send({ type: "outline", slides: outline() });
+    } catch {
+      // an odd deck must never break the remote
+    }
   }
 
   function goTo(s) {
@@ -114,7 +200,10 @@
       principal = !!data.principal;
       // A new principal resumes where the room was, then reports from there.
       if (principal && data.state) goTo(data.state);
-      if (principal) reportState();
+      if (principal) {
+        reportState();
+        sendOutline();
+      }
       status("connected", connectedLabel());
     } else if (data.type === "state") {
       if (!principal) goTo(data); // followers mirror the projector
@@ -126,19 +215,46 @@
     }
   }
 
+  // ------------------------------------------------------------ HTTP fallback
+  // Followers keep mirroring the projector through long polls while the
+  // WebSocket is down. The projector itself needs the WebSocket.
+  async function pollLoop() {
+    if (polling) return;
+    polling = true;
+    while (!(socket && socket.readyState === WebSocket.OPEN)) {
+      try {
+        const res = await fetch(HTTP_URL + "?since=" + lastVersion, { cache: "no-store" });
+        const body = await res.json();
+        if (body.state) {
+          lastVersion = body.state.version || 0;
+          goTo(body.state);
+        }
+        status("connected", "Following the projector · HTTP");
+      } catch {
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    }
+    polling = false;
+  }
+
   function connect() {
-    status("connecting", "Connecting to remote");
+    if (!polling) status("connecting", "Connecting to remote");
     const ws = new WebSocket(WS_URL);
     socket = ws;
+    let opened = false;
     ws.onopen = () => {
+      opened = true;
       retry = 0;
+      failures = 0;
       lastHeard = Date.now();
+      keepAwake();
     };
     ws.onmessage = onMessage;
     ws.onclose = () => {
       if (socket !== ws) return;
       principal = false;
-      status("disconnected", "Remote lost, retrying");
+      if (!opened && ++failures >= 2) pollLoop();
+      if (!polling) status("disconnected", "Remote lost, retrying");
       // 1 s, 2 s, 4 s ... up to 10 s, with jitter so many tabs do not retry at once.
       const wait = Math.min(10000, 1000 * 2 ** retry++) * (0.75 + Math.random() / 2);
       setTimeout(connect, wait);
@@ -154,7 +270,9 @@
   }, 5000);
   // Phones and laptops suspend tabs: check the link as soon as we are visible.
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") send({ type: "hb" });
+    if (document.visibilityState !== "visible") return;
+    send({ type: "hb" });
+    keepAwake();
   });
 
   function start() {
