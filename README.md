@@ -119,8 +119,21 @@ The relay owns the slide state of each room (cast code):
   which only appears in the presenter's page (where the upload lands), its
   "Go to Slides" and "Go to Controls" links and its QR. Without the key a
   connection cannot send commands, read the speaker notes or become the
-  projector. The projector moves the key from its address bar into the tab's
-  session, so it is not shown to the room. Gleam and the relay share the
+  projector. "Go to Slides" goes through `/present/CODE?k=KEY`, which leaves
+  the key in an HttpOnly cookie scoped to that one deck's path and opens the
+  deck with no key in the address bar the room can see. On every load with
+  that cookie (a reload of the projector) the server writes the key into the
+  deck's script tag and keeps the notes. Every tab of that deck the presenter
+  opens or reloads is keyed for 12 hours. The cookie is `SameSite=Strict` and
+  counts only on navigations the presenter starts (`Sec-Fetch-Site` of
+  `none` or `same-origin`), so another site or another deck that opens this
+  deck in a window gets a plain audience copy and cannot become the projector.
+- **Decks are sandboxed.** Uploaded HTML runs scripts, so every deck is served
+  with `Content-Security-Policy: sandbox allow-scripts ...`: it gets its own
+  opaque origin and cannot read other decks, cookies or storage on this site.
+  The price: forms, `localStorage` (and Reveal's own speaker view, `S`) do not
+  work in a deck, and embedded iframes or `target=_blank` links inherit the
+  sandbox, so some embeds (YouTube) may refuse to play. Gleam and the relay share the
   secret (`CAST_SECRET` or `data/cast-secret`); with no secret the relay
   refuses all control.
 
@@ -138,7 +151,10 @@ The relay owns the slide state of each room (cast code):
 - Codes are refused unless they match `[A-Za-z0-9_-]{1,32}`. Uploading under
   a code that is already in use needs that code's control key (the `k` form
   field, which "Replace slides" on the presenter page fills in); without it
-  the upload is refused. Usernames and file names are reduced to
+  the upload is refused. Each deck file (username + file name) belongs to the
+  code the server's store says, and another code cannot overwrite it. The
+  code and the deck are claimed in one step before converting, so two
+  uploads at once cannot both pass. Usernames and file names are reduced to
   `[A-Za-z0-9 ._()-]` before they become paths. Codes created before control
   keys existed have no link carrying their key: upload under a new code.
 - **Prediction (low latency):** the principal reports where `next` and `prev`
@@ -151,7 +167,9 @@ The relay owns the slide state of each room (cast code):
   `<aside class="notes">` of every slide) to the relay, which passes it only to
   remotes, never to audience screens. The server also strips the notes out of
   the deck page unless it is asked for with the key, so the audience cannot
-  read them in the page source.
+  read them in the page source: `<aside class="notes">` (nested asides too),
+  `data-notes` and Reveal markdown notes (`Note:` in `data-markdown`
+  sections, honouring `data-separator*`).
 - **HTTP fallback:** when WebSockets are blocked (school or office proxies),
   phones and audience screens switch to long polling after two failed
   attempts. The projector still needs the WebSocket.
