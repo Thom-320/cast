@@ -102,6 +102,7 @@ re-uploads. Phones can join at `/join`.
 | `RELAY_PORT` | Relay port (HTTP + WebSocket) | `8080` |
 | `GLEAM_URL` | Where the relay proxies HTTP | `http://127.0.0.1:6767` |
 | `CAST_STATE_FILE` | Last slide of each room, survives relay restarts | `./relay-state.json` |
+| `LONG_POLL_MS` | How long an HTTP fallback poll waits for news | `25000` |
 | `SLIDES_DIR` | Slides output directory | `./slides` |
 | `VIEW_DIR` | Presentation HTML directory | `./view` |
 | `QR_DIR` | QR code directory | `./qr` |
@@ -123,13 +124,37 @@ The relay owns the slide state of each room (cast code):
   of silence as a dead link and reconnect with backoff (1 s up to 10 s).
 - Codes are refused unless they match `[A-Za-z0-9_-]{1,32}`; a code already
   owned by another presenter cannot be overwritten.
+- **Prediction (low latency):** the principal reports where `next` and `prev`
+  would land. When a phone taps, the relay forwards the command to the
+  projector and, at the same moment, sends that predicted slide to phones and
+  audience screens, so they do not wait for the projector's round trip. The
+  projector's real report then confirms it. Going back into a vertical stack
+  is not predicted; it just waits for the projector.
+- **Teleprompter:** the principal sends an outline (title and
+  `<aside class="notes">` of every slide) to the relay, which passes it only to
+  remotes, never to audience screens.
+- **HTTP fallback:** when WebSockets are blocked (school or office proxies),
+  phones and audience screens switch to long polling after two failed
+  attempts. The projector still needs the WebSocket.
+
+```
+GET  /relay/room/CODE?since=VERSION&type=controller&ov=OUTLINE_VERSION   long poll
+POST /relay/room/CODE/cmd   body: {"action":"next","id":"..."}   (text/plain is fine)
+GET  /relay/health
+```
+
+Phone controls: tap the left third to go back and the rest to go forward, or
+swipe. Tap the counter to jump to any slide. The timer starts on the first
+command (tap to pause, hold to reset). The page asks the phone to keep its
+screen on (Wake Lock; needs https).
 
 Protocol (old clients still work):
 
 ```
 remote       -> {type:"cmd", action:"next"|"prev"|"goto", indexh?, indexv?, id?}
-presentation -> {type:"state", indexh, indexv, indexf?, total}
-relay        -> state | {type:"rol", principal, state?} | presence | ack | hb
+presentation -> {type:"state", indexh, indexv, indexf?, total, next?, prev?}
+presentation -> {type:"outline", slides:[{h, v, title, notes}]}   (principal only)
+relay        -> state (predicted?) | outline | {type:"rol", principal, state?} | presence | ack | hb
 ```
 
 ## Directory Structure
