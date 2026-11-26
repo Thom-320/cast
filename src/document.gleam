@@ -1,5 +1,6 @@
 import config
 import control
+import deck
 import gleam/bit_array
 import gleam/crypto
 import gleam/http
@@ -66,46 +67,33 @@ pub fn handle_convert(req: wisp.Request, ctx: types.Context) -> wisp.Response {
     )
 
     // A code already in use is replaced only by whoever holds its control
-    // key (from the presenter page). The username proves nothing: it is
-    // public in every deck URL.
+    // key (from the presenter page); the username proves nothing, it is public
+    // in every deck URL. A deck file belongs to the code the store says, and
+    // another code may not overwrite it. Checked and claimed in one step.
     let given_key = list.key_find(formdata.values, "k") |> result.unwrap("")
-    use _ <- result.try(case store.get(ctx.store, cast_code) {
-      option.Some(_) ->
-        case control.valid(ctx.secret, cast_code, string.trim(given_key)) {
-          True -> Ok(Nil)
-          False -> Error(CodeTaken)
+    let key_ok = control.valid(ctx.secret, cast_code, string.trim(given_key))
+    use previous <- result.try(
+      store.reserve(ctx.store, cast_code, username, filename, key_ok)
+      |> result.map_error(fn(e) {
+        case e {
+          types.CodeInUse -> CodeTaken
+          types.DeckInUse -> DeckTaken
         }
-      option.None -> Ok(Nil)
-    })
-
-    // Same username and file name means the same deck file. Whoever owns the
-    // deck already there must hold its key; another code may not overwrite it.
-    use _ <- result.try(
-      case
-        simplifile.read(
-          view_output_dir <> username <> "/" <> view_filename(filename),
-        )
-      {
-        Error(_) -> Ok(Nil)
-        Ok(existing) ->
-          case deck_code(existing) {
-            Ok(owner) if owner == cast_code ->
-              case control.valid(ctx.secret, owner, string.trim(given_key)) {
-                True -> Ok(Nil)
-                False -> Error(CodeTaken)
-              }
-            _ -> Error(DeckTaken)
-          }
-      },
+      }),
     )
 
-    use _ <- result.try(case determine_filetype(filename) {
-      Pdf -> convert_pdf(filename, path, username, cast_code)
-      Pptx -> convert_pptx(filename, path, username, cast_code)
-      Html -> convert_html(filename, path, username, cast_code)
-      Unsupported -> Error(UnsupportedFileFormat)
-    })
-
+    use _ <- result.try(
+      case determine_filetype(filename) {
+        Pdf -> convert_pdf(filename, path, username, cast_code)
+        Pptx -> convert_pptx(filename, path, username, cast_code)
+        Html -> convert_html(filename, path, username, cast_code)
+        Unsupported -> Error(UnsupportedFileFormat)
+      }
+      |> result.map_error(fn(e) {
+        store.release(ctx.store, cast_code, previous)
+        e
+      }),
+    )
     store.set(ctx.store, username, filename, cast_code)
 
     use _ <- result.try(
@@ -225,25 +213,9 @@ pub fn lower_extension(name: String) -> String {
   }
 }
 
-/// The cast code a generated deck was built for (its remote script tag).
-pub fn deck_code(html: String) -> Result(String, Nil) {
-  case string.split_once(html, "data-cast-code='") {
-    Ok(#(_, rest)) ->
-      case string.split_once(rest, "'") {
-        Ok(#(code, _)) -> Ok(code)
-        Error(_) -> Error(Nil)
-      }
-    Error(_) -> Error(Nil)
-  }
-}
-
 /// The name the generated presentation is saved under in ./view/<username>/.
 pub fn view_filename(filename: String) -> String {
-  case determine_filetype(filename) {
-    Pdf -> string.replace(filename, ".pdf", ".html")
-    Pptx -> string.replace(filename, ".pptx", ".html")
-    Html | Unsupported -> filename
-  }
+  deck.view_filename(filename)
 }
 
 fn remote_script_tag(cast_code: String) -> String {

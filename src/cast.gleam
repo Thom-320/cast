@@ -3,6 +3,8 @@ import control
 import document
 import gleam/bytes_tree
 import gleam/erlang/process
+import gleam/http
+import gleam/http/request
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
@@ -54,6 +56,7 @@ fn routes(req: Request, ctx: types.Context) -> Response {
       serve_view_page(req, username, filename, ctx)
     ["view", code] -> serve_view_connection_page(req, code, ctx)
     ["cast", code] -> handle_cast_code(code, ctx)
+    ["present", code] -> serve_present(req, code, ctx)
     ["code", code] -> handle_cast_code(code, ctx)
     ["controls", code] -> serve_controls_page(req, code, ctx)
     ["qr", code] -> serve_qr_code(req, code, ctx)
@@ -74,8 +77,13 @@ fn handle_cast_code(code: String, ctx: types.Context) -> Response {
   }
 }
 
-// The deck. Everyone gets it, but the speaker notes only go to the window
-// that brings the deck's control key (the presenter's projector link).
+// The deck. Everyone gets it, but the speaker notes and the control key only
+// go to the window that brings the deck's key: in ?k= (the presenter's
+// projector link) or in the HttpOnly cookie that link leaves for this deck's
+// path, so a reload keeps working without the key in the address bar.
+//
+// Decks are uploaded HTML, so each one runs sandboxed in its own opaque
+// origin: its scripts cannot read other decks' pages, storage or cookies.
 fn serve_view_page(
   req: Request,
   username: String,
@@ -89,17 +97,106 @@ fn serve_view_page(
   let html_path = "./view/" <> safe_username <> "/" <> safe_filename
   case simplifile.read(html_path) {
     Ok(content) -> {
-      let keyed = case document.deck_code(content) {
-        Ok(code) -> has_key(req, code, ctx)
-        Error(_) -> False
+      // The store says which code owns this deck; only its key counts.
+      let code = store.owner_of(ctx.store, safe_username, safe_filename)
+      let from_query = case code {
+        Some(c) -> has_key(req, c, ctx)
+        None -> False
       }
-      let content = case keyed {
-        True -> content
-        False -> notes.strip(content)
+      let from_cookie = case code {
+        Some(c) ->
+          own_navigation(req)
+          && control.valid(ctx.secret, c, cookie(req, deck_cookie))
+        None -> False
       }
-      wisp.html_response(content, 200) |> private_page
+      let res = case code, from_query || from_cookie {
+        Some(c), True -> {
+          let key = control.key(ctx.secret, c)
+          let tag = "data-cast-code='" <> c <> "'"
+          string.replace(content, tag, tag <> " data-cast-key='" <> key <> "'")
+          |> wisp.html_response(200)
+          // The raw (still percent-encoded) path, as the browser compares it.
+          |> set_deck_cookie(req, req.path, key)
+        }
+        _, _ -> wisp.html_response(notes.strip(content), 200)
+      }
+      res
+      |> private_page
+      |> wisp.set_header(
+        "content-security-policy",
+        "sandbox allow-scripts allow-popups allow-modals allow-presentation allow-downloads",
+      )
     }
     Error(_) -> wisp.html_response("Presentation not found", 404)
+  }
+}
+
+const deck_cookie = "cast_k"
+
+/// The cookie counts only for navigations the user or our own pages start
+/// (typed, reloaded, same-origin). A missing header is an older browser or
+/// a script, which cannot send the cookie cross-site anyway.
+fn own_navigation(req: Request) -> Bool {
+  case request.get_header(req, "sec-fetch-site") {
+    Ok("same-origin") | Ok("none") | Error(_) -> True
+    _ -> False
+  }
+}
+
+fn cookie(req: Request, name: String) -> String {
+  request.get_cookies(req) |> list.key_find(name) |> result.unwrap("")
+}
+
+// Scoped to this one deck's path, invisible to scripts, and Strict: another
+// site (or another deck, which runs in an opaque origin) that opens this deck
+// in a window does not get it, so it cannot become the room's projector.
+fn set_deck_cookie(res: Response, req: Request, path: String, key: String) {
+  let secure = case request.get_header(req, "x-forwarded-proto"), req.scheme {
+    Ok("https"), _ -> "; Secure"
+    _, http.Https -> "; Secure"
+    _, _ -> ""
+  }
+  wisp.set_header(
+    res,
+    "set-cookie",
+    deck_cookie
+      <> "="
+      <> key
+      <> "; Path="
+      <> path
+      <> "; Max-Age=43200; HttpOnly; SameSite=Strict"
+      <> secure,
+  )
+}
+
+/// The presenter's "Go to Slides": checks the key, leaves it in the deck's
+/// HttpOnly cookie and opens the deck as the projector, with no key in the
+/// URL. (The deck runs sandboxed and cannot rewrite its own address.)
+fn serve_present(req: Request, code: String, ctx: types.Context) -> Response {
+  case store.get(ctx.store, code), has_key(req, code, ctx) {
+    Some(#(username, filename)), True -> {
+      let deck_path =
+        "/view/"
+        <> uri.percent_encode(username)
+        <> "/"
+        <> uri.percent_encode(document.view_filename(filename))
+      // A same-origin hop instead of a 303: when the link was opened from
+      // another site (chat, mail), a redirect stays cross-site and the Strict
+      // cookie would not go along.
+      let target = html_escape(deck_path <> "?proyector=1")
+      wisp.html_response(
+        "<!doctype html><meta http-equiv=\"refresh\" content=\"0;url="
+          <> target
+          <> "\"><a href=\""
+          <> target
+          <> "\">Open the slides</a>",
+        200,
+      )
+      |> set_deck_cookie(req, deck_path, control.key(ctx.secret, code))
+      |> private_page
+    }
+    Some(_), False -> wisp.redirect("/cast/" <> code)
+    None, _ -> wisp.html_response("Invalid or expired cast code", 404)
   }
 }
 
@@ -130,18 +227,17 @@ fn serve_view_connection_page(
 ) -> Response {
   case store.get(ctx.store, code), has_key(req, code, ctx) {
     Some(_), False -> wisp.redirect("/cast/" <> code)
-    Some(#(username, filename)), True -> {
+    Some(#(username, _filename)), True -> {
       use <- wisp.rescue_crashes
 
-      let html_filename = document.view_filename(filename)
       let k = control.key(ctx.secret, code)
 
       // Construct URLs
       let qr_url = "/qr/" <> code <> "?k=" <> k
       // The window opened from here is the projector: the one the remotes
       // drive and every other screen follows.
-      let presentation_url =
-        "/view/" <> username <> "/" <> html_filename <> "?proyector=1&k=" <> k
+      // Through /present: the key never shows in the projector's address bar.
+      let presentation_url = "/present/" <> code <> "?k=" <> k
       let controls_url = "/controls/" <> code <> "?k=" <> k
       let replace_url = "/upload?code=" <> code <> "&k=" <> k
 

@@ -5,6 +5,7 @@
 //// "Invalid or expired cast code". The file is replayed in order on start:
 //// later lines win.
 
+import deck
 import envoy
 import gleam/dict
 import gleam/erlang/process
@@ -14,7 +15,9 @@ import gleam/otp/actor
 import gleam/result
 import gleam/string
 import simplifile
-import types.{type Message, Get, Store}
+import types.{
+  type Message, CodeInUse, DeckInUse, Get, Owner, Release, Reserve, Store,
+}
 
 pub fn codes_file() -> String {
   envoy.get("CODES_FILE") |> result.unwrap("./data/codes.tsv")
@@ -74,7 +77,109 @@ pub fn handle_message(state: types.CodeStore, msg: Message) {
       actor.send(reply, option.from_result(dict.get(state, code)))
       actor.continue(state)
     }
+    Owner(username, view_filename, reply) -> {
+      actor.send(reply, owner(state, username, view_filename))
+      actor.continue(state)
+    }
+    Reserve(code, username, filename, key_ok, reply) -> {
+      let previous = dict.get(state, code)
+      let view = deck.view_filename(filename)
+      let check = case previous, key_ok {
+        Ok(_), False -> Error(CodeInUse)
+        _, _ ->
+          case owner(state, username, view) {
+            option.Some(c) if c == code -> Ok(Nil)
+            option.Some(_) -> Error(DeckInUse)
+            // A file nobody in the store owns (older uploads, or the same
+            // name in other letter case on a case-insensitive disk).
+            option.None ->
+              case
+                simplifile.is_file(deck.view_dir <> username <> "/" <> view)
+              {
+                Ok(True) -> Error(DeckInUse)
+                _ -> Ok(Nil)
+              }
+          }
+      }
+      case check {
+        Error(e) -> {
+          actor.send(reply, Error(e))
+          actor.continue(state)
+        }
+        Ok(_) -> {
+          actor.send(reply, Ok(option.from_result(previous)))
+          actor.continue(dict.insert(state, code, #(username, filename)))
+        }
+      }
+    }
+    Release(code, previous) ->
+      actor.continue(case previous {
+        option.Some(entry) -> dict.insert(state, code, entry)
+        option.None -> dict.delete(state, code)
+      })
   }
+}
+
+/// The code whose entry points at ./view/<username>/<view_filename>. Older
+/// versions let several codes point at one file; then the file's own tag
+/// picks among them, and nobody owns it if that does not settle it.
+pub fn owner(
+  state: types.CodeStore,
+  username: String,
+  view_filename: String,
+) -> Option(String) {
+  let codes =
+    dict.fold(state, [], fn(acc, code, entry) {
+      let #(u, f) = entry
+      case u == username && deck.view_filename(f) == view_filename {
+        True -> [code, ..acc]
+        False -> acc
+      }
+    })
+  case codes {
+    [] -> option.None
+    [code] -> option.Some(code)
+    _ -> {
+      let tagged =
+        simplifile.read(deck.view_dir <> username <> "/" <> view_filename)
+        |> result.replace_error(Nil)
+        |> result.try(deck.code_in)
+      case tagged {
+        Ok(code) ->
+          case list.contains(codes, code) {
+            True -> option.Some(code)
+            False -> option.None
+          }
+        Error(_) -> option.None
+      }
+    }
+  }
+}
+
+pub fn owner_of(
+  store: process.Subject(Message),
+  username: String,
+  view_filename: String,
+) -> Option(String) {
+  process.call(store, 1000, Owner(username, view_filename, _))
+}
+
+pub fn reserve(
+  store: process.Subject(Message),
+  code: String,
+  username: String,
+  filename: String,
+  key_ok: Bool,
+) -> Result(Option(#(String, String)), types.ReserveError) {
+  process.call(store, 2000, Reserve(code, username, filename, key_ok, _))
+}
+
+pub fn release(
+  store: process.Subject(Message),
+  code: String,
+  previous: Option(#(String, String)),
+) -> Nil {
+  actor.send(store, Release(code, previous))
 }
 
 pub fn get(
