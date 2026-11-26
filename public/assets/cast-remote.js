@@ -5,7 +5,8 @@
 //
 // Open the deck with ?proyector=1&k=KEY (the presenter's link) on the screen
 // everyone watches: that window is the one the remotes drive. Any window
-// without the control key (the audience) just follows it.
+// without the control key (the audience) just follows it. The server may also
+// hand the key in data-cast-key (after a reload of the presenter's window).
 // Speaker notes (<aside class="notes">) go to the remote's teleprompter only.
 (function () {
   const script = document.currentScript;
@@ -15,16 +16,11 @@
     (params.get("proyector") || params.get("projector") || "").toLowerCase(),
   );
 
-  // The key is moved out of the address bar (the projector shows it to the
-  // room) into this tab's session, so a reload keeps it.
-  const KEY_SLOT = "cast-k-" + castCode;
-  let controlKey = params.get("k") || "";
-  try {
-    if (controlKey) sessionStorage.setItem(KEY_SLOT, controlKey);
-    else controlKey = sessionStorage.getItem(KEY_SLOT) || "";
-  } catch {
-    // no session storage: the key still works until the tab closes
-  }
+  // The key comes in ?k= the first time; the server then leaves it in an
+  // HttpOnly cookie for this deck and writes it into our script tag on every
+  // reload. It is taken out of the address bar, which the room can see.
+  // (Decks run sandboxed in an opaque origin: no storage to keep it in.)
+  const controlKey = params.get("k") || script.dataset.castKey || "";
   if (params.has("k")) {
     params.delete("k");
     const rest = params.toString();
@@ -177,41 +173,8 @@
     );
     return (doc.body.textContent || "").replace(/\n{3,}/g, "\n\n").trim();
   }
-  function noteOf(slide) {
-    const aside = slide.querySelector(":scope > aside.notes");
-    if (aside) return aside.innerHTML;
-    return slide.getAttribute("data-notes") || "";
-  }
-
-  // The server leaves speaker notes out of a page asked for without the key.
-  // After a reload the key lives in this tab only, so fetch the keyed copy
-  // once and read the notes from it, by slide position.
-  let fetchedNotes = null; // Map "h.v" -> notes html, or null if not needed
-  async function loadNotes() {
-    if (!controlKey) return;
-    if (document.querySelector(".reveal .slides aside.notes, .reveal .slides [data-notes]")) return;
-    try {
-      const res = await fetch(location.pathname + "?k=" + encodeURIComponent(controlKey), {
-        cache: "no-store",
-        credentials: "same-origin",
-      });
-      if (!res.ok) return;
-      const doc = new DOMParser().parseFromString(await res.text(), "text/html");
-      const map = new Map();
-      doc.querySelectorAll(".reveal .slides > section").forEach((top, h) => {
-        const stack = top.querySelectorAll(":scope > section");
-        if (stack.length) stack.forEach((sec, v) => map.set(h + "." + v, noteOf(sec)));
-        else map.set(h + ".0", noteOf(top));
-      });
-      fetchedNotes = map;
-    } catch {
-      // the teleprompter just shows titles
-    }
-  }
-  function notesText(slide, i) {
-    let html = Reveal.getSlideNotes(slide);
-    if (!html && fetchedNotes) html = fetchedNotes.get(i.h + "." + (i.v || 0));
-    return htmlToText(html);
+  function notesText(slide) {
+    return htmlToText(Reveal.getSlideNotes(slide));
   }
   function outline() {
     return Reveal.getSlides().map((slide) => {
@@ -220,7 +183,7 @@
       const title = (heading ? heading.textContent : slide.getAttribute("data-title") || "")
         .replace(/\s+/g, " ")
         .trim();
-      return { h: i.h, v: i.v || 0, title, notes: notesText(slide, i) };
+      return { h: i.h, v: i.v || 0, title, notes: notesText(slide) };
     });
   }
   function sendOutline() {
@@ -337,8 +300,6 @@
     Reveal.on("fragmentshown", reportState);
     Reveal.on("fragmenthidden", reportState);
     connect();
-    // Resend the teleprompter once notes come from the keyed copy.
-    loadNotes().then(() => fetchedNotes && sendOutline());
   }
 
   if (Reveal.isReady()) start();
