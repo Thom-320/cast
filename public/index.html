@@ -118,6 +118,23 @@
         </section>
 
         <section class="spot-section">
+          <label class="spot-label" for="controlKey">Control Key</label>
+          <input
+            name="k"
+            class="field"
+            id="controlKey"
+            type="password"
+            placeholder="Only to replace slides under a code you already use"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+          />
+          <p class="meta" style="margin-top: var(--space-2)">
+            Filled in for you by "Replace slides" on your presenter page. Leave empty for a new code.
+          </p>
+        </section>
+
+        <section class="spot-section">
           <span class="spot-label">Upload File</span>
           <div class="spot-frame drop-zone" id="dropZone">
             <div class="spot-frame__in"></div>
@@ -163,6 +180,21 @@
     </main>
 
     <script>
+      // "Replace slides" links here with ?code=&k=: fill the form, then take
+      // the key out of the address bar and history.
+      (function () {
+        const q = new URLSearchParams(location.search);
+        if (q.get("code")) document.getElementById("castCode").value = q.get("code");
+        if (q.get("k")) document.getElementById("controlKey").value = q.get("k");
+        if (q.has("k")) {
+          q.delete("k");
+          const rest = q.toString();
+          try {
+            history.replaceState(null, "", location.pathname + (rest ? "?" + rest : ""));
+          } catch {}
+        }
+      })();
+
       const dropZone = document.getElementById("dropZone");
       const fileInput = document.getElementById("fileInput");
 

@@ -222,6 +222,9 @@
     <script>
       (function () {
         const castCode = "{{CAST_CODE}}";
+        // The control key comes only with the presenter's QR or link.
+        const controlKey = "{{CONTROL_KEY}}";
+        let refused = false; // the relay said this key cannot steer the room
         const configured = "{{WS_URL}}";
         const params = new URLSearchParams(location.search);
         const who = (params.get("quien") || params.get("who") || "").slice(0, 24);
@@ -237,6 +240,7 @@
         const BASE = relayBase();
         const WS_URL =
           BASE + "?cast_code=" + encodeURIComponent(castCode) + "&type=controller" +
+          "&k=" + encodeURIComponent(controlKey) +
           (who ? "&quien=" + encodeURIComponent(who) : "");
         const HTTP_URL =
           BASE.replace(/^ws/, "http").replace(/\/ws\/?$|\/$/, "") + "/relay/room/" + encodeURIComponent(castCode);
@@ -266,6 +270,7 @@
           connected: "Connected",
           disconnected: "Reconnecting",
           noprojector: "Projector offline",
+          nokey: "This link cannot control the slides",
         };
         function setStatus(kind) {
           $("connectionStatus").dataset.status = kind;
@@ -273,9 +278,10 @@
           if (kind === "connected" && polling) text += " · HTTP";
           if (kind === "connected" && rtt !== null) text += " · " + rtt + " ms";
           $("statusText").textContent = text;
-          $("pad").classList.toggle("disabled", kind === "connecting" || kind === "disconnected");
+          $("pad").classList.toggle("disabled", kind === "connecting" || kind === "disconnected" || kind === "nokey");
         }
         function showLinkState() {
+          if (refused) return setStatus("nokey");
           if (!wsOpen() && !polling) return;
           setStatus(projector === "none" ? "noprojector" : "connected");
         }
@@ -409,8 +415,12 @@
             try { data = JSON.parse(event.data); } catch { return; }
             handle(data);
           };
-          ws.onclose = () => {
+          ws.onclose = (event) => {
             if (socket !== ws) return;
+            if (event.code === 4401) {
+              refused = true; // retrying cannot help
+              return showLinkState();
+            }
             if (!opened && ++failures >= 2) pollLoop();
             if (!polling) setStatus("disconnected");
             const wait = Math.min(10000, 1000 * 2 ** retry++) * (0.75 + Math.random() / 2);
@@ -426,13 +436,18 @@
           if (polling) return;
           polling = true;
           showLinkState();
-          while (!wsOpen()) {
+          while (!wsOpen() && !refused) {
             try {
               const since = state && typeof state.version === "number" ? state.version : 0;
               const res = await fetch(
-                HTTP_URL + "?type=controller&since=" + since + "&ov=" + outlineVersion,
+                HTTP_URL + "?type=controller&k=" + encodeURIComponent(controlKey) +
+                  "&since=" + since + "&ov=" + outlineVersion,
                 { cache: "no-store" },
               );
+              if (res.status === 401) {
+                refused = true;
+                break;
+              }
               const body = await res.json();
               if (body.outline) onOutline(body.outline);
               if (body.presence) onPresence(body.presence);
@@ -451,8 +466,12 @@
               method: "POST",
               // text/plain keeps it a simple request: no CORS preflight round trip.
               headers: { "content-type": "text/plain" },
-              body: JSON.stringify({ ...msg, quien: who }),
+              body: JSON.stringify({ ...msg, quien: who, k: controlKey }),
             });
+            if (res.status === 401) {
+              refused = true;
+              return showLinkState();
+            }
             handle(await res.json());
           } catch {
             // stays pending; resent when a connection comes back

@@ -57,22 +57,25 @@
         <section class="spot-section connect__text">
           <span class="spot-label" style="margin-bottom: 0">Cast Code</span>
           <h1 class="spot-hero" style="overflow-wrap: anywhere">{{CAST_CODE}}</h1>
-          <p class="lead">Scan or enter the code to connect your remote.</p>
+          <p class="lead">Scan the QR to control the slides from your phone. Keep this page off the projector: the QR and these buttons carry the control key. The audience follows along with the code at /join.</p>
           <div class="actions">
-            <button
-              onclick="window.open('{{PRESENTATION_URL}}', '_blank')"
+            <a
+              href="{{PRESENTATION_URL}}"
+              target="_blank"
+              rel="noopener noreferrer"
               class="spot-button spot-button--accent"
-              type="button"
             >
               Go to Slides →
-            </button>
-            <button
-              onclick="window.open('{{CONTROLS_URL}}', '_blank')"
+            </a>
+            <a
+              href="{{CONTROLS_URL}}"
+              target="_blank"
+              rel="noopener noreferrer"
               class="spot-button spot-button--solid"
-              type="button"
             >
               Go to Controls →
-            </button>
+            </a>
+            <a href="{{REPLACE_URL}}" rel="noreferrer" class="spot-button">Replace slides →</a>
           </div>
         </section>
 
