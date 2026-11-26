@@ -1,4 +1,5 @@
 import config
+import control
 import document
 import gleam/bytes_tree
 import gleam/erlang/process
@@ -8,6 +9,7 @@ import gleam/result
 import gleam/string
 import gleam/uri
 import mist
+import notes
 import simplifile
 import store
 import types
@@ -21,7 +23,7 @@ pub fn main() {
 
   let secret_key_base = wisp.random_string(64)
 
-  let ctx = types.Context(store:)
+  let ctx = types.Context(store:, secret: control.load_secret())
   let handler = fn(req) { routes(req, ctx) }
   let conf = config.get_config()
 
@@ -48,12 +50,13 @@ fn routes(req: Request, ctx: types.Context) -> Response {
     [] | ["upload"] -> serve_index()
     ["join"] -> serve_join_page(req, ctx)
 
-    ["view", username, filename] -> serve_view_page(username, filename)
-    ["view", code] -> serve_view_connection_page(code, ctx)
+    ["view", username, filename] ->
+      serve_view_page(req, username, filename, ctx)
+    ["view", code] -> serve_view_connection_page(req, code, ctx)
     ["cast", code] -> handle_cast_code(code, ctx)
     ["code", code] -> handle_cast_code(code, ctx)
-    ["controls", code] -> serve_controls_page(code, ctx)
-    ["qr", route_code] -> serve_qr_code(route_code)
+    ["controls", code] -> serve_controls_page(req, code, ctx)
+    ["qr", code] -> serve_qr_code(req, code, ctx)
     ["slides", ..rest] -> serve_static_file("./slides/", rest)
     ["assets", ..rest] -> serve_asset(rest)
     _ -> wisp.not_found()
@@ -71,32 +74,76 @@ fn handle_cast_code(code: String, ctx: types.Context) -> Response {
   }
 }
 
-fn serve_view_page(username: String, filename: String) -> Response {
+// The deck. Everyone gets it, but the speaker notes only go to the window
+// that brings the deck's control key (the presenter's projector link).
+fn serve_view_page(
+  req: Request,
+  username: String,
+  filename: String,
+  ctx: types.Context,
+) -> Response {
   use <- wisp.rescue_crashes
 
   let safe_username = string.replace(username, "..", "")
   let safe_filename = string.replace(filename, "..", "")
   let html_path = "./view/" <> safe_username <> "/" <> safe_filename
   case simplifile.read(html_path) {
-    Ok(content) -> wisp.html_response(content, 200)
+    Ok(content) -> {
+      let keyed = case document.deck_code(content) {
+        Ok(code) -> has_key(req, code, ctx)
+        Error(_) -> False
+      }
+      let content = case keyed {
+        True -> content
+        False -> notes.strip(content)
+      }
+      wisp.html_response(content, 200) |> private_page
+    }
     Error(_) -> wisp.html_response("Presentation not found", 404)
   }
 }
 
-fn serve_view_connection_page(code: String, ctx: types.Context) -> Response {
-  case store.get(ctx.store, code) {
-    Some(#(username, filename)) -> {
+/// Pages that may carry the control key in their URL: never cached, and the
+/// URL never leaks to other sites (or our own logs) through Referer.
+fn private_page(res: Response) -> Response {
+  res
+  |> wisp.set_header("referrer-policy", "no-referrer")
+  |> wisp.set_header("cache-control", "no-store")
+}
+
+/// The control key given in the query (?k=...), or "".
+fn query_key(req: Request) -> String {
+  list.key_find(wisp.get_query(req), "k") |> result.unwrap("")
+}
+
+fn has_key(req: Request, code: String, ctx: types.Context) -> Bool {
+  control.valid(ctx.secret, code, query_key(req))
+}
+
+// The presenter's page (reached right after uploading): projector link,
+// remote link and QR, all carrying the control key. Without the key the
+// visitor is audience and just follows the slides.
+fn serve_view_connection_page(
+  req: Request,
+  code: String,
+  ctx: types.Context,
+) -> Response {
+  case store.get(ctx.store, code), has_key(req, code, ctx) {
+    Some(_), False -> wisp.redirect("/cast/" <> code)
+    Some(#(username, filename)), True -> {
       use <- wisp.rescue_crashes
 
       let html_filename = document.view_filename(filename)
+      let k = control.key(ctx.secret, code)
 
       // Construct URLs
-      let qr_url = "/qr/" <> code
+      let qr_url = "/qr/" <> code <> "?k=" <> k
       // The window opened from here is the projector: the one the remotes
       // drive and every other screen follows.
       let presentation_url =
-        "/view/" <> username <> "/" <> html_filename <> "?proyector=1"
-      let controls_url = "/controls/" <> code
+        "/view/" <> username <> "/" <> html_filename <> "?proyector=1&k=" <> k
+      let controls_url = "/controls/" <> code <> "?k=" <> k
+      let replace_url = "/upload?code=" <> code <> "&k=" <> k
 
       case simplifile.read("./public/view.html") {
         Ok(content) -> {
@@ -104,40 +151,55 @@ fn serve_view_connection_page(code: String, ctx: types.Context) -> Response {
             content
             |> string.replace("{{CAST_CODE}}", code)
             |> string.replace("{{QR_URL}}", qr_url)
-            |> string.replace("{{PRESENTATION_URL}}", presentation_url)
-            |> string.replace("{{CONTROLS_URL}}", controls_url)
-            |> string.replace("{{USERNAME}}", username)
-          wisp.html_response(html, 200)
+            |> string.replace(
+              "{{PRESENTATION_URL}}",
+              html_escape(presentation_url),
+            )
+            |> string.replace("{{CONTROLS_URL}}", html_escape(controls_url))
+            |> string.replace("{{REPLACE_URL}}", html_escape(replace_url))
+            |> string.replace("{{USERNAME}}", html_escape(username))
+          wisp.html_response(html, 200) |> private_page
         }
         Error(_) -> wisp.html_response("Connection page not found", 500)
       }
     }
-    None -> wisp.redirect("/")
+    None, _ -> wisp.redirect("/")
     // Invalid/expired code → redirect to index
   }
 }
 
-fn serve_controls_page(code: String, ctx: types.Context) -> Response {
-  case store.get(ctx.store, code) {
-    Some(#(username, _filename)) -> {
+fn serve_controls_page(
+  req: Request,
+  code: String,
+  ctx: types.Context,
+) -> Response {
+  case store.get(ctx.store, code), has_key(req, code, ctx) {
+    Some(_), False ->
+      render_join(
+        code,
+        "This link cannot steer the slides. The presenter's remote opens from the QR on their own presenter page. With the code you can follow along.",
+      )
+    Some(#(username, _filename)), True -> {
       use <- wisp.rescue_crashes
       case simplifile.read("./public/controls.html") {
         Ok(content) -> {
           let content_with_code =
             string.replace(content, "{{CAST_CODE}}", code)
+            |> string.replace("{{CONTROL_KEY}}", control.key(ctx.secret, code))
             |> string.replace("{{USERNAME}}", html_escape(username))
             |> string.replace("{{WS_URL}}", config.get_config().websocket_url)
-          wisp.html_response(content_with_code, 200)
+          wisp.html_response(content_with_code, 200) |> private_page
         }
         Error(_) -> wisp.html_response("Controls page not found", 404)
       }
     }
-    None -> wisp.redirect("/join?code=" <> uri.percent_encode(code))
+    None, _ -> wisp.redirect("/join?code=" <> uri.percent_encode(code))
   }
 }
 
-// GET /join shows the code form; GET /join?code=X sends a known code to its
-// controls and re-shows the form with an error otherwise.
+// GET /join shows the code form; GET /join?code=X opens a known code's slides
+// on this device (following the projector) and re-shows the form otherwise.
+// The code never gives control: that comes with the presenter's QR.
 fn serve_join_page(req: Request, ctx: types.Context) -> Response {
   use <- wisp.rescue_crashes
 
@@ -148,22 +210,21 @@ fn serve_join_page(req: Request, ctx: types.Context) -> Response {
   let known =
     document.is_valid_cast_code(code) && store.get(ctx.store, code) != None
 
-  case known {
-    True -> wisp.redirect("/controls/" <> code)
-    False ->
-      case simplifile.read("./public/join.html") {
-        Ok(content) -> {
-          let error = case code {
-            "" -> ""
-            _ -> "No cast is running with that code."
-          }
-          content
-          |> string.replace("{{ERROR}}", error)
-          |> string.replace("{{CODE}}", html_escape(code))
-          |> wisp.html_response(200)
-        }
-        Error(_) -> wisp.html_response("Join page not found", 500)
-      }
+  case known, code {
+    True, _ -> wisp.redirect("/cast/" <> code)
+    False, "" -> render_join(code, "")
+    False, _ -> render_join(code, "No cast is running with that code.")
+  }
+}
+
+fn render_join(code: String, error: String) -> Response {
+  case simplifile.read("./public/join.html") {
+    Ok(content) ->
+      content
+      |> string.replace("{{ERROR}}", html_escape(error))
+      |> string.replace("{{CODE}}", html_escape(code))
+      |> wisp.html_response(200)
+    Error(_) -> wisp.html_response("Join page not found", 500)
   }
 }
 
@@ -176,10 +237,33 @@ fn html_escape(text: String) -> String {
   |> string.replace("'", "&#39;")
 }
 
-fn serve_qr_code(code: String) -> Response {
+// The QR opens the remote, so it carries the control key and needs it too.
+// Made on demand, so codes from before the key get a working QR.
+fn serve_qr_code(req: Request, code: String, ctx: types.Context) -> Response {
   use <- wisp.rescue_crashes
 
-  let qr_path = "./qr/" <> code <> ".png"
+  let qr_path = document.control_qr_path(code)
+  let ready = case
+    document.is_valid_cast_code(code) && has_key(req, code, ctx),
+    simplifile.is_file(qr_path)
+  {
+    False, _ -> False
+    True, Ok(True) -> True
+    True, _ ->
+      document.generate_qr_code(
+        document.public_base_url(req),
+        code,
+        control.key(ctx.secret, code),
+      )
+      |> result.is_ok
+  }
+  case ready {
+    False -> wisp.html_response("QR code not found", 404)
+    True -> serve_qr_file(qr_path) |> private_page
+  }
+}
+
+fn serve_qr_file(qr_path: String) -> Response {
   case simplifile.read_bits(qr_path) {
     Ok(content) ->
       wisp.response(200)
@@ -250,7 +334,14 @@ fn serve_index() -> Response {
   use <- wisp.rescue_crashes
 
   case simplifile.read("./public/index.html") {
-    Ok(content) -> wisp.html_response(content, 200)
+    // Opened from "Replace slides" it carries the control key in the URL.
+    // Not no-referrer: then the form's POST goes out with Origin: null and
+    // the CSRF check refuses the upload. same-origin still keeps the URL
+    // from other sites.
+    Ok(content) ->
+      wisp.html_response(content, 200)
+      |> wisp.set_header("referrer-policy", "same-origin")
+      |> wisp.set_header("cache-control", "no-store")
     Error(_) -> wisp.html_response("Error loading page", 500)
   }
 }

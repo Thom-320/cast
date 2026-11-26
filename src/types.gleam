@@ -6,7 +6,7 @@ pub type CodeStore =
   dict.Dict(String, #(String, String))
 
 pub type Context {
-  Context(store: process.Subject(Message))
+  Context(store: process.Subject(Message), secret: String)
 }
 
 pub type Message {

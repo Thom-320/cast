@@ -1,4 +1,7 @@
 import config
+import control
+import gleam/bit_array
+import gleam/crypto
 import gleam/http
 import gleam/int
 import gleam/list
@@ -17,13 +20,14 @@ const view_output_dir: String = "./view/"
 
 const qr_output_dir: String = "./qr"
 
-
 type ThisThingError {
   NoUsername
   NoFile
   UnsupportedFileFormat
   InvalidCastCode
+  InvalidUsername
   CodeTaken
+  DeckTaken
   FailedGenerating(why: List(#(String, String)))
 }
 
@@ -36,12 +40,20 @@ pub fn handle_convert(req: wisp.Request, ctx: types.Context) -> wisp.Response {
       list.key_find(formdata.values, "username")
       |> result.map_error(fn(_) { NoUsername }),
     )
+    // Both end up in file paths (./view/USER/FILE): no separators, no "..".
+    let username = safe_name(username)
+    use _ <- result.try(case username {
+      "" | "_" -> Error(InvalidUsername)
+      _ -> Ok(Nil)
+    })
     use file <- result.try(
       list.key_find(formdata.files, "data")
       |> result.map_error(fn(_) { NoFile }),
     )
 
-    let filename = file.file_name
+    // Lowercase extension: on a case-insensitive disk "talk.PDF" would write
+    // into talk.pdf's slides while the ownership check looked at another name.
+    let filename = file.file_name |> safe_name |> lower_extension
     let path = file.path
 
     // An explicit cast code lets a deck keep the same code across uploads.
@@ -53,12 +65,39 @@ pub fn handle_convert(req: wisp.Request, ctx: types.Context) -> wisp.Response {
       |> choose_cast_code,
     )
 
-    // Re-uploading under your own code replaces your deck; someone else's
-    // code is not yours to overwrite.
+    // A code already in use is replaced only by whoever holds its control
+    // key (from the presenter page). The username proves nothing: it is
+    // public in every deck URL.
+    let given_key = list.key_find(formdata.values, "k") |> result.unwrap("")
     use _ <- result.try(case store.get(ctx.store, cast_code) {
-      option.Some(#(owner, _)) if owner != username -> Error(CodeTaken)
-      _ -> Ok(Nil)
+      option.Some(_) ->
+        case control.valid(ctx.secret, cast_code, string.trim(given_key)) {
+          True -> Ok(Nil)
+          False -> Error(CodeTaken)
+        }
+      option.None -> Ok(Nil)
     })
+
+    // Same username and file name means the same deck file. Whoever owns the
+    // deck already there must hold its key; another code may not overwrite it.
+    use _ <- result.try(
+      case
+        simplifile.read(
+          view_output_dir <> username <> "/" <> view_filename(filename),
+        )
+      {
+        Error(_) -> Ok(Nil)
+        Ok(existing) ->
+          case deck_code(existing) {
+            Ok(owner) if owner == cast_code ->
+              case control.valid(ctx.secret, owner, string.trim(given_key)) {
+                True -> Ok(Nil)
+                False -> Error(CodeTaken)
+              }
+            _ -> Error(DeckTaken)
+          }
+      },
+    )
 
     use _ <- result.try(case determine_filetype(filename) {
       Pdf -> convert_pdf(filename, path, username, cast_code)
@@ -70,7 +109,11 @@ pub fn handle_convert(req: wisp.Request, ctx: types.Context) -> wisp.Response {
     store.set(ctx.store, username, filename, cast_code)
 
     use _ <- result.try(
-      generate_qr_code(public_base_url(req), cast_code)
+      generate_qr_code(
+        public_base_url(req),
+        cast_code,
+        control.key(ctx.secret, cast_code),
+      )
       |> result.map_error(FailedGenerating),
     )
 
@@ -79,7 +122,9 @@ pub fn handle_convert(req: wisp.Request, ctx: types.Context) -> wisp.Response {
 
   case result {
     Ok(#(_username, _filename, cast_code)) -> {
-      let view_url = "/view/" <> cast_code
+      // The presenter's page: the only place the control key is handed out.
+      let view_url =
+        "/view/" <> cast_code <> "?k=" <> control.key(ctx.secret, cast_code)
       wisp.redirect(view_url)
     }
     Error(e) ->
@@ -93,9 +138,15 @@ pub fn handle_convert(req: wisp.Request, ctx: types.Context) -> wisp.Response {
             "Cast codes can only use letters, numbers, - and _ (max 32)",
             400,
           )
+        InvalidUsername -> wisp.html_response("Pick another username", 400)
         CodeTaken ->
           wisp.html_response(
-            "That cast code belongs to another presenter. Pick another one.",
+            "That cast code is in use. To replace its slides, use \"Replace slides\" on its presenter page (it fills in the control key); otherwise pick another code.",
+            409,
+          )
+        DeckTaken ->
+          wisp.html_response(
+            "Another presentation already uses that username and file name. Rename the file or pick another username.",
             409,
           )
         FailedGenerating(why) ->
@@ -118,6 +169,37 @@ fn choose_cast_code(code: String) -> Result(String, ThisThingError) {
   }
 }
 
+/// Keeps letters, digits, space and - _ . ( ) ; anything else becomes "_",
+/// and ".." can never survive, so the name is safe as one path segment.
+pub fn safe_name(name: String) -> String {
+  let allowed =
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -_.()"
+  let cleaned =
+    name
+    |> string.trim
+    |> string.to_graphemes
+    |> list.map(fn(c) {
+      case string.contains(allowed, c) {
+        True -> c
+        False -> "_"
+      }
+    })
+    |> string.concat
+    |> string.slice(0, 120)
+  let cleaned = case string.starts_with(cleaned, ".") {
+    True -> "_" <> cleaned
+    False -> cleaned
+  }
+  no_double_dots(cleaned)
+}
+
+fn no_double_dots(s: String) -> String {
+  case string.contains(s, "..") {
+    True -> no_double_dots(string.replace(s, "..", "._"))
+    False -> s
+  }
+}
+
 pub fn is_valid_cast_code(code: String) -> Bool {
   let length = string.length(code)
   length > 0
@@ -130,6 +212,29 @@ pub fn is_valid_cast_code(code: String) -> Bool {
       c,
     )
   })
+}
+
+/// "Talk.PDF" -> "Talk.pdf". Names without a dot are unchanged.
+pub fn lower_extension(name: String) -> String {
+  case string.split(name, ".") |> list.reverse {
+    [ext, first, ..rest] ->
+      [string.lowercase(ext), first, ..rest]
+      |> list.reverse
+      |> string.join(".")
+    _ -> name
+  }
+}
+
+/// The cast code a generated deck was built for (its remote script tag).
+pub fn deck_code(html: String) -> Result(String, Nil) {
+  case string.split_once(html, "data-cast-code='") {
+    Ok(#(_, rest)) ->
+      case string.split_once(rest, "'") {
+        Ok(#(code, _)) -> Ok(code)
+        Error(_) -> Error(Nil)
+      }
+    Error(_) -> Error(Nil)
+  }
 }
 
 /// The name the generated presentation is saved under in ./view/<username>/.
@@ -211,13 +316,25 @@ fn convert_html(
   }
 }
 
-fn generate_qr_code(
+/// QR of the presenter's remote link (with the control key).
+/// Named by a hash of the exact code: on case-insensitive disks "ab" and
+/// "AB" must not share (and leak) one QR.
+pub fn control_qr_path(cast_code: String) -> String {
+  let name =
+    crypto.hash(crypto.Sha256, bit_array.from_string(cast_code))
+    |> bit_array.base16_encode
+    |> string.lowercase
+  qr_output_dir <> "/control/" <> name <> ".png"
+}
+
+pub fn generate_qr_code(
   base_url: String,
   cast_code: String,
+  key: String,
 ) -> Result(Nil, List(#(String, String))) {
-  let qr_url = base_url <> "/controls/" <> cast_code
-  let qr_path = qr_output_dir <> "/" <> cast_code <> ".png"
-  let _ = simplifile.create_directory_all(qr_output_dir)
+  let qr_url = base_url <> "/controls/" <> cast_code <> "?k=" <> key
+  let qr_path = control_qr_path(cast_code)
+  let _ = simplifile.create_directory_all(qr_output_dir <> "/control")
 
   case
     gleamyshell.execute("qrrs", in: ".", args: [
