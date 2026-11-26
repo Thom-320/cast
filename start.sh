@@ -67,7 +67,7 @@ fi
 echo ""
 echo -e "${GREEN}✅ All services started successfully!${NC}"
 echo -e "${GREEN}   📱 Open: http://localhost:${RELAY_PORT:-8080}  (one port for slides, remotes and WebSocket)${NC}"
-echo -e "${GREEN}   🖥️  On the projector add ?proyector=1 to the presentation URL${NC}"
+echo -e "${GREEN}   🖥️  After uploading, use the presenter page: Go to Slides opens the projector, its QR the remote${NC}"
 echo ""
 echo -e "${YELLOW}Press Ctrl+C to stop all services${NC}"
 echo ""

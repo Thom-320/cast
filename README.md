@@ -88,7 +88,7 @@ manim-slides convert --one-file MyScene talk.html
 ```
 
 Fill in the optional cast code on the upload form to keep the same code across
-re-uploads. Phones can join at `/join`.
+re-uploads. The audience can follow the slides on their phones at `/join`.
 
 ## Environment Variables
 
@@ -102,6 +102,8 @@ re-uploads. Phones can join at `/join`.
 | `RELAY_PORT` | Relay port (HTTP + WebSocket) | `8080` |
 | `GLEAM_URL` | Where the relay proxies HTTP | `http://127.0.0.1:6767` |
 | `CAST_STATE_FILE` | Last slide of each room, survives relay restarts | `./relay-state.json` |
+| `CAST_SECRET` | Signs control keys (any long random string). Empty means `CAST_SECRET_FILE` | empty |
+| `CAST_SECRET_FILE` | Created by the Gleam server on first start (mode 600); the relay reads it | `./data/cast-secret` |
 | `LONG_POLL_MS` | How long an HTTP fallback poll waits for news | `25000` |
 | `SLIDES_DIR` | Slides output directory | `./slides` |
 | `VIEW_DIR` | Presentation HTML directory | `./view` |
@@ -111,8 +113,19 @@ re-uploads. Phones can join at `/join`.
 
 The relay owns the slide state of each room (cast code):
 
-- Exactly one presentation is the **principal**: the newest one opened with
-  `?proyector=1`, or else the oldest one connected. Remote commands go only to
+- **Code vs. control key.** The cast code is public: it is in every audience
+  page and on screen, and with it anyone can follow the slides (`/join`).
+  Steering needs the control key, `HMAC-SHA256(secret, "cast-control:" + code)`,
+  which only appears in the presenter's page (where the upload lands), its
+  "Go to Slides" and "Go to Controls" links and its QR. Without the key a
+  connection cannot send commands, read the speaker notes or become the
+  projector. The projector moves the key from its address bar into the tab's
+  session, so it is not shown to the room. Gleam and the relay share the
+  secret (`CAST_SECRET` or `data/cast-secret`); with no secret the relay
+  refuses all control.
+
+- Exactly one presentation is the **principal**: the newest keyed one opened
+  with `?proyector=1`, or else the oldest keyed one. Remote commands go only to
   it and only its state counts. Every other window and every phone mirrors that
   absolute state, so a forgotten tab can no longer drag the room around.
 - A principal that reloads (or a new one) resumes the room's slide instead of
@@ -122,8 +135,12 @@ The relay owns the slide state of each room (cast code):
   Phones show "Projector offline" when nothing is listening.
 - Heartbeat every 20 s (WebSocket ping plus `{type:"hb"}`); clients treat 45 s
   of silence as a dead link and reconnect with backoff (1 s up to 10 s).
-- Codes are refused unless they match `[A-Za-z0-9_-]{1,32}`; a code already
-  owned by another presenter cannot be overwritten.
+- Codes are refused unless they match `[A-Za-z0-9_-]{1,32}`. Uploading under
+  a code that is already in use needs that code's control key (the `k` form
+  field, which "Replace slides" on the presenter page fills in); without it
+  the upload is refused. Usernames and file names are reduced to
+  `[A-Za-z0-9 ._()-]` before they become paths. Codes created before control
+  keys existed have no link carrying their key: upload under a new code.
 - **Prediction (low latency):** the principal reports where `next` and `prev`
   would land. When a phone taps, the relay forwards the command to the
   projector and, at the same moment, sends that predicted slide to phones and
@@ -132,14 +149,17 @@ The relay owns the slide state of each room (cast code):
   is not predicted; it just waits for the projector.
 - **Teleprompter:** the principal sends an outline (title and
   `<aside class="notes">` of every slide) to the relay, which passes it only to
-  remotes, never to audience screens.
+  remotes, never to audience screens. The server also strips the notes out of
+  the deck page unless it is asked for with the key, so the audience cannot
+  read them in the page source.
 - **HTTP fallback:** when WebSockets are blocked (school or office proxies),
   phones and audience screens switch to long polling after two failed
   attempts. The projector still needs the WebSocket.
 
 ```
-GET  /relay/room/CODE?since=VERSION&type=controller&ov=OUTLINE_VERSION   long poll
-POST /relay/room/CODE/cmd   body: {"action":"next","id":"..."}   (text/plain is fine)
+GET  /relay/room/CODE?since=VERSION&type=controller&k=KEY&ov=OUTLINE_VERSION   long poll
+GET  /relay/room/CODE?since=VERSION                     audience long poll (no key)
+POST /relay/room/CODE/cmd   body: {"action":"next","id":"...","k":"KEY"}   (text/plain is fine)
 GET  /relay/health
 ```
 
@@ -151,7 +171,7 @@ screen on (Wake Lock; needs https).
 Protocol (old clients still work):
 
 ```
-remote       -> {type:"cmd", action:"next"|"prev"|"goto", indexh?, indexv?, id?}
+remote       -> {type:"cmd", action:"next"|"prev"|"goto", indexh?, indexv?, id?}   (needs k)
 presentation -> {type:"state", indexh, indexv, indexf?, total, next?, prev?}
 presentation -> {type:"outline", slides:[{h, v, title, notes}]}   (principal only)
 relay        -> state (predicted?) | outline | {type:"rol", principal, state?} | presence | ack | hb
