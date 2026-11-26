@@ -133,7 +133,10 @@ The relay owns the slide state of each room (cast code):
   opaque origin and cannot read other decks, cookies or storage on this site.
   The price: forms, `localStorage` (and Reveal's own speaker view, `S`) do not
   work in a deck, and embedded iframes or `target=_blank` links inherit the
-  sandbox, so some embeds (YouTube) may refuse to play. Gleam and the relay share the
+  sandbox, so some embeds (YouTube) may refuse to play. Decks also cannot be
+  framed by other pages (`frame-ancestors 'none'`) and are opened with
+  `Cross-Origin-Opener-Policy: same-origin`, so a page that opens a deck
+  keeps no handle on its window. Gleam and the relay share the
   secret (`CAST_SECRET` or `data/cast-secret`); with no secret the relay
   refuses all control.
 
@@ -154,7 +157,11 @@ The relay owns the slide state of each room (cast code):
   the upload is refused. Each deck file (username + file name) belongs to the
   code the server's store says, and another code cannot overwrite it. The
   code and the deck are claimed in one step before converting, so two
-  uploads at once cannot both pass. Usernames and file names are reduced to
+  uploads at once cannot both pass. The old deck stays live until the new
+  one is converted; a failed or abandoned upload (the browser closed) gives
+  the claim back. When a code moves to another file, the old deck file goes.
+  An uploaded page that already carries a cast script (a saved projector
+  page) loses it, old code and key included. Usernames and file names are reduced to
   `[A-Za-z0-9 ._()-]` before they become paths. Codes created before control
   keys existed have no link carrying their key: upload under a new code.
 - **Prediction (low latency):** the principal reports where `next` and `prev`
@@ -165,11 +172,14 @@ The relay owns the slide state of each room (cast code):
   is not predicted; it just waits for the projector.
 - **Teleprompter:** the principal sends an outline (title and
   `<aside class="notes">` of every slide) to the relay, which passes it only to
-  remotes, never to audience screens. The server also strips the notes out of
-  the deck page unless it is asked for with the key, so the audience cannot
-  read them in the page source: `<aside class="notes">` (nested asides too),
-  `data-notes` and Reveal markdown notes (`Note:` in `data-markdown`
-  sections, honouring `data-separator*`).
+  remotes, never to audience screens. The audience never gets the notes in
+  the page source either: at upload the server writes an audience copy of
+  the deck (`audience/`) without `<aside class="notes">` (nested asides
+  too), `data-notes` and Reveal markdown notes (`Note:` in `data-markdown`
+  sections, honouring `data-separator*`), and every load without the key
+  gets that copy. It is rebuilt if it is missing or older than the deck. The
+  stripper reads tags the way a browser does and, when in doubt (a tag that
+  never closes), drops the rest of the page rather than show a note.
 - **HTTP fallback:** when WebSockets are blocked (school or office proxies),
   phones and audience screens switch to long polling after two failed
   attempts. The projector still needs the WebSocket.
@@ -208,6 +218,7 @@ cast/
 │       └── vendor/   # Third-party libraries
 ├── slides/           # Generated slide images
 ├── view/             # Generated presentation HTML
+├── audience/         # The same decks without speaker notes
 ├── qr/               # Generated QR codes
 ├── websocket_relay.js # WebSocket relay server
 ├── setup.sh          # Asset setup script

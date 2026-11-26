@@ -15,6 +15,7 @@ public/assets/css/*.css
 # Generated presentations
 slides/
 view/
+audience/
 qr/
 
 # IDE
