@@ -37,6 +37,7 @@
         background: var(--ink);
       }
       .status[data-status="disconnected"] .dot,
+      .status[data-status="noprojector"] .dot,
       .status[data-status="error"] .dot {
         background: var(--accent);
         border-color: var(--accent);
@@ -113,87 +114,133 @@
           type="button"
           id="stopBtn"
         >
-          ■ Stop Presentation
+          ■ Leave Remote
         </button>
-        <p class="meta">Connected as {{USERNAME}}</p>
+        <p class="meta" id="presence" aria-live="polite"></p>
+        <p class="meta">Presentation by {{USERNAME}}</p>
       </footer>
     </main>
     <script>
       (function () {
         const castCode = "{{CAST_CODE}}";
-        const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+        const configured = "{{WS_URL}}";
+        const params = new URLSearchParams(location.search);
+        const who = (params.get("quien") || params.get("who") || "").slice(0, 24);
+
+        function relayBase() {
+          if (configured && !configured.startsWith("{{")) return configured.replace(/\?.*$/, "");
+          const proto = location.protocol === "https:" ? "wss://" : "ws://";
+          // Served straight from the Gleam port: the relay listens next to it on 8080.
+          const host = location.port === "6767" ? location.hostname + ":8080" : location.host;
+          return proto + host + "/ws/";
+        }
         const WS_URL =
-          protocol + "cast.matwa.dev/ws/?cast_code=" + castCode + "&type=controller";
+          relayBase() + "?cast_code=" + encodeURIComponent(castCode) + "&type=controller" +
+          (who ? "&quien=" + encodeURIComponent(who) : "");
 
         const statusLabels = {
           connecting: "Connecting",
           connected: "Connected",
-          disconnected: "Disconnected",
-          error: "Connection Error",
+          disconnected: "Reconnecting",
+          noprojector: "Projector offline",
         };
 
         let socket = null;
-        let currentSlide = 1;
-        let totalSlides = 0;
+        let lastHeard = 0;
+        let retry = 0;
+        let projector = "none";
+        const pending = new Map(); // id -> {msg, sent}
 
         function updateConnectionStatus(status) {
           document.getElementById("connectionStatus").dataset.status = status;
           document.getElementById("statusText").textContent = statusLabels[status];
-          const disabled = status !== "connected";
+          const disabled = status === "connecting" || status === "disconnected";
           document.getElementById("nextBtn").disabled = disabled;
           document.getElementById("prevBtn").disabled = disabled;
+        }
+        function showLinkState() {
+          if (!socket || socket.readyState !== WebSocket.OPEN) return;
+          updateConnectionStatus(projector === "none" ? "noprojector" : "connected");
+        }
+        function presenceText(p) {
+          const others = p.controllers.filter(Boolean);
+          const screens = p.presentations === 1 ? "1 screen" : p.presentations + " screens";
+          const remotes = others.length === 1 ? "1 remote" : others.length + " remotes";
+          return (p.projector === "none" ? "No projector connected" : screens) + " · " + remotes;
         }
 
         function connect() {
           updateConnectionStatus("connecting");
-          socket = new WebSocket(WS_URL);
+          const ws = new WebSocket(WS_URL);
+          socket = ws;
 
-          socket.onopen = () => {
-            console.log("Connected to control server");
-            updateConnectionStatus("connected");
-          };
-
-          socket.onmessage = (event) => {
-            const data = JSON.parse(event.data);
-            if (data.type === "state") {
-              currentSlide = data.indexh + 1;
-              totalSlides = data.total;
-              updateSlideDisplay();
+          ws.onopen = () => {
+            retry = 0;
+            lastHeard = Date.now();
+            showLinkState();
+            // Commands that never got an ack are resent with the same id:
+            // the relay drops repeats, so a retry can never advance twice.
+            const now = Date.now();
+            for (const [id, p] of pending) {
+              if (now - p.sent > 8000) pending.delete(id);
+              else ws.send(JSON.stringify(p.msg));
             }
           };
 
-          socket.onclose = () => {
-            console.log("Disconnected, reconnecting in 3s...");
+          ws.onmessage = (event) => {
+            lastHeard = Date.now();
+            let data;
+            try { data = JSON.parse(event.data); } catch { return; }
+            if (data.type === "state") {
+              document.getElementById("currentSlide").textContent = data.indexh + 1;
+              document.getElementById("totalSlides").textContent = data.total || "?";
+            } else if (data.type === "presence") {
+              projector = data.projector;
+              document.getElementById("presence").textContent = presenceText(data);
+              showLinkState();
+            } else if (data.type === "ack") {
+              pending.delete(data.id);
+              if (!data.delivered) document.getElementById("presence").textContent =
+                "Not sent: no projector connected";
+            }
+          };
+
+          ws.onclose = () => {
+            if (socket !== ws) return;
             updateConnectionStatus("disconnected");
-            setTimeout(connect, 3000);
+            const wait = Math.min(10000, 1000 * 2 ** retry++) * (0.75 + Math.random() / 2);
+            setTimeout(connect, wait);
           };
-
-          socket.onerror = (error) => {
-            console.error("WebSocket error:", error);
-            updateConnectionStatus("error");
-          };
+          ws.onerror = () => {};
         }
 
-        function updateSlideDisplay() {
-          document.getElementById("currentSlide").textContent = currentSlide;
-          document.getElementById("totalSlides").textContent = totalSlides;
-        }
+        // The relay speaks every 20 s; 45 s of silence means a dead link.
+        setInterval(() => {
+          if (socket && socket.readyState === WebSocket.OPEN && Date.now() - lastHeard > 45000) socket.close();
+        }, 5000);
+        document.addEventListener("visibilitychange", () => {
+          if (document.visibilityState !== "visible") return;
+          if (socket && socket.readyState === WebSocket.OPEN) socket.send('{"type":"hb"}');
+          else if (!socket || socket.readyState === WebSocket.CLOSED) connect();
+        });
 
         function sendCommand(action) {
-          if (socket && socket.readyState === WebSocket.OPEN) {
-            socket.send(JSON.stringify({ type: "cmd", action }));
-          }
+          const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+          const msg = { type: "cmd", action, id };
+          pending.set(id, { msg, sent: Date.now() });
+          if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(msg));
+          if (navigator.vibrate) navigator.vibrate(15);
         }
 
-        document
-          .getElementById("nextBtn")
-          .addEventListener("click", () => sendCommand("next"));
-        document
-          .getElementById("prevBtn")
-          .addEventListener("click", () => sendCommand("prev"));
+        document.getElementById("nextBtn").addEventListener("click", () => sendCommand("next"));
+        document.getElementById("prevBtn").addEventListener("click", () => sendCommand("prev"));
+        document.addEventListener("keydown", (e) => {
+          if (["ArrowRight", "PageDown", " "].includes(e.key)) { e.preventDefault(); sendCommand("next"); }
+          if (["ArrowLeft", "PageUp"].includes(e.key)) { e.preventDefault(); sendCommand("prev"); }
+        });
         document.getElementById("stopBtn").addEventListener("click", () => {
-          if (confirm("Stop presentation?")) {
-            socket.close();
+          if (confirm("Leave the remote?")) {
+            if (socket) socket.close();
             window.location.href = "/";
           }
         });
